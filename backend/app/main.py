@@ -30,7 +30,7 @@ app.add_middleware(
 )
 
 
-PART_NUMBER_PATTERN = re.compile(r"[A-Z0-9-]{5,}")
+PART_NUMBER_PATTERN = re.compile(r"(?=.*\d)[A-Z0-9-]{5,}")
 NUMBER_PATTERN = re.compile(r"-?\d+(?:\.\d+)?")
 
 
@@ -53,6 +53,12 @@ def _read_pdf_lines(upload_file: UploadFile) -> Iterable[str]:
 
 
 def _match_part_number(line: str) -> str:
+    tokens = re.split(r"\s+", line.strip())
+    for raw_token in tokens:
+        token = raw_token.strip(".,;:()[]{}")
+        if PART_NUMBER_PATTERN.fullmatch(token):
+            return token
+
     match = PART_NUMBER_PATTERN.search(line)
     return match.group(0) if match else ""
 
