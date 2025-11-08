@@ -30,7 +30,7 @@ app.add_middleware(
 )
 
 
-PART_NUMBER_PATTERN = re.compile(r"(?=.*\d)[A-Z0-9-]{5,}")
+PART_NUMBER_PATTERN = re.compile(r"(?=.*\d)[A-Za-z0-9\-_/]{3,}")
 NUMBER_PATTERN = re.compile(r"-?\d+(?:\.\d+)?")
 
 
@@ -61,6 +61,45 @@ def _match_part_number(line: str) -> str:
 
     match = PART_NUMBER_PATTERN.search(line)
     return match.group(0) if match else ""
+
+
+def _find_nearby_part_number(lines: List[str], index: int) -> str:
+    """Locate a part number around ``index``.
+
+    PDF の表構造がテキスト化される際、列ごとに改行されることが多く、L/W
+    値と品番が別行に分断される場合がある。そのため、現在行だけでなく周辺
+    の数行も含めて部品番号を探索する。
+    """
+
+    candidate = _match_part_number(lines[index])
+    if candidate:
+        return candidate
+
+    # 直前の行から最大 3 行、空行に到達したら打ち切る。
+    for offset in range(1, 4):
+        prev_index = index - offset
+        if prev_index < 0:
+            break
+        prev_line = lines[prev_index]
+        if not prev_line.strip():
+            break
+        candidate = _match_part_number(prev_line)
+        if candidate:
+            return candidate
+
+    # 直後の行も 2 行まで確認。こちらも空行で区切る。
+    for offset in range(1, 3):
+        next_index = index + offset
+        if next_index >= len(lines):
+            break
+        next_line = lines[next_index]
+        if not next_line.strip():
+            break
+        candidate = _match_part_number(next_line)
+        if candidate:
+            return candidate
+
+    return ""
 
 
 def _value_in_line(line: str, raw_value: str) -> bool:
@@ -94,11 +133,11 @@ def _value_in_line(line: str, raw_value: str) -> bool:
     return False
 
 
-def _filter_results(lines: Iterable[str], l_value: str, w_value: str, file_name: str) -> List[SearchResult]:
+def _filter_results(lines: List[str], l_value: str, w_value: str, file_name: str) -> List[SearchResult]:
     results: List[SearchResult] = []
-    for line in lines:
+    for index, line in enumerate(lines):
         if _value_in_line(line, l_value) and _value_in_line(line, w_value):
-            part_number = _match_part_number(line)
+            part_number = _find_nearby_part_number(lines, index)
             results.append(
                 SearchResult(
                     part_number=part_number or "(not found)",
