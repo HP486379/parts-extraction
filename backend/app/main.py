@@ -4,11 +4,22 @@ import csv
 import io
 import re
 from dataclasses import dataclass, asdict
+<<<<<<< ours
 from typing import Iterable, List
+=======
+from typing import Iterable, List, Optional
+>>>>>>> theirs
 
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+<<<<<<< ours
+=======
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
+import sys
+>>>>>>> theirs
 from PyPDF2 import PdfReader
 
 
@@ -21,6 +32,23 @@ class SearchResult:
 
 app = FastAPI(title="Parts Extraction API")
 
+<<<<<<< ours
+=======
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent.parent
+
+FRONTEND_DIST = BASE_DIR / "frontend_dist"
+
+if FRONTEND_DIST.exists():
+    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
+
+    @app.get("/", include_in_schema=False)
+    async def index():
+        return FileResponse(FRONTEND_DIST / "index.html")
+
+>>>>>>> theirs
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -66,7 +94,11 @@ def _match_part_number(line: str) -> str:
 def _find_nearby_part_number(lines: List[str], index: int) -> str:
     """Locate a part number around ``index``.
 
+<<<<<<< ours
     PDF の表構造がテキスト化される際、列ごとに改行されることが多く、L/W
+=======
+    PDF の表構造がテキスト化される際、列ごとに改行されることが多く、L/W/T
+>>>>>>> theirs
     値と品番が別行に分断される場合がある。そのため、現在行だけでなく周辺
     の数行も含めて部品番号を探索する。
     """
@@ -133,10 +165,30 @@ def _value_in_line(line: str, raw_value: str) -> bool:
     return False
 
 
+<<<<<<< ours
 def _filter_results(lines: List[str], l_value: str, w_value: str, file_name: str) -> List[SearchResult]:
     results: List[SearchResult] = []
     for index, line in enumerate(lines):
         if _value_in_line(line, l_value) and _value_in_line(line, w_value):
+=======
+def _filter_results(
+    lines: List[str],
+    l_value: str,
+    w_value: str,
+    t_value: Optional[str],
+    file_name: str,
+) -> List[SearchResult]:
+    results: List[SearchResult] = []
+    t_value_normalized = (t_value or "").strip()
+    t_required = bool(t_value_normalized)
+
+    for index, line in enumerate(lines):
+        if (
+            _value_in_line(line, l_value)
+            and _value_in_line(line, w_value)
+            and (not t_required or _value_in_line(line, t_value_normalized))
+        ):
+>>>>>>> theirs
             part_number = _find_nearby_part_number(lines, index)
             results.append(
                 SearchResult(
@@ -153,13 +205,27 @@ async def search_parts(
     files: List[UploadFile] = File(..., description="PDF files to search"),
     l_value: str = Form(..., description="Target L value"),
     w_value: str = Form(..., description="Target W value"),
+<<<<<<< ours
+=======
+    t_value: Optional[str] = Form(None, description="Target T value"),
+>>>>>>> theirs
     return_csv: bool = Form(False, description="If true, return a CSV file"),
 ):
     all_results: List[SearchResult] = []
 
     for upload in files:
         lines = list(_read_pdf_lines(upload))
+<<<<<<< ours
         matches = _filter_results(lines, l_value, w_value, upload.filename or "unknown.pdf")
+=======
+        matches = _filter_results(
+            lines,
+            l_value,
+            w_value,
+            t_value,
+            upload.filename or "unknown.pdf",
+        )
+>>>>>>> theirs
         all_results.extend(matches)
 
     if return_csv:
