@@ -4,22 +4,15 @@ import csv
 import io
 import re
 from dataclasses import dataclass, asdict
-<<<<<<< ours
-from typing import Iterable, List
-=======
 from typing import Iterable, List, Optional
->>>>>>> theirs
 
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
-<<<<<<< ours
-=======
-from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 import sys
->>>>>>> theirs
+
 from PyPDF2 import PdfReader
 
 
@@ -32,8 +25,10 @@ class SearchResult:
 
 app = FastAPI(title="Parts Extraction API")
 
-<<<<<<< ours
-=======
+
+# --------------------------------------------------------------------
+# Frontend dist auto detect (for packaged app or dev)
+# --------------------------------------------------------------------
 if getattr(sys, "frozen", False):
     BASE_DIR = Path(sys.executable).parent
 else:
@@ -48,7 +43,10 @@ if FRONTEND_DIST.exists():
     async def index():
         return FileResponse(FRONTEND_DIST / "index.html")
 
->>>>>>> theirs
+
+# --------------------------------------------------------------------
+# CORS
+# --------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -58,18 +56,14 @@ app.add_middleware(
 )
 
 
+# --------------------------------------------------------------------
+# PDF parsing patterns
+# --------------------------------------------------------------------
 PART_NUMBER_PATTERN = re.compile(r"(?=.*\d)[A-Za-z0-9\-_/]{3,}")
 NUMBER_PATTERN = re.compile(r"-?\d+(?:\.\d+)?")
 
-
 def _read_pdf_lines(upload_file: UploadFile) -> Iterable[str]:
-    """Yield the text lines contained in ``upload_file``.
-
-    The function reads the uploaded PDF into memory only once so that the
-    underlying ``SpooledTemporaryFile`` can be safely reused by other parts of
-    the request lifecycle.
-    """
-
+    """Yield the text lines contained in ``upload_file``."""
     data = upload_file.file.read()
     upload_file.file.seek(0)
 
@@ -92,22 +86,12 @@ def _match_part_number(line: str) -> str:
 
 
 def _find_nearby_part_number(lines: List[str], index: int) -> str:
-    """Locate a part number around ``index``.
-
-<<<<<<< ours
-    PDF の表構造がテキスト化される際、列ごとに改行されることが多く、L/W
-=======
-    PDF の表構造がテキスト化される際、列ごとに改行されることが多く、L/W/T
->>>>>>> theirs
-    値と品番が別行に分断される場合がある。そのため、現在行だけでなく周辺
-    の数行も含めて部品番号を探索する。
-    """
-
+    """Locate a part number around ``index``."""
     candidate = _match_part_number(lines[index])
     if candidate:
         return candidate
 
-    # 直前の行から最大 3 行、空行に到達したら打ち切る。
+    # Look backward
     for offset in range(1, 4):
         prev_index = index - offset
         if prev_index < 0:
@@ -119,7 +103,7 @@ def _find_nearby_part_number(lines: List[str], index: int) -> str:
         if candidate:
             return candidate
 
-    # 直後の行も 2 行まで確認。こちらも空行で区切る。
+    # Look forward
     for offset in range(1, 3):
         next_index = index + offset
         if next_index >= len(lines):
@@ -135,13 +119,7 @@ def _find_nearby_part_number(lines: List[str], index: int) -> str:
 
 
 def _value_in_line(line: str, raw_value: str) -> bool:
-    """Return ``True`` when ``raw_value`` can be considered present in ``line``.
-
-    数値を単なる部分一致で探すと「20」が「120」にヒットするなど誤検出が
-    起きやすいため、数値としての比較と、桁をまたがない文字列一致の両方で
-    判定を行う。
-    """
-
+    """Return True when ``raw_value`` can be considered present in line."""
     value = raw_value.strip()
     if not value:
         return False
@@ -165,12 +143,6 @@ def _value_in_line(line: str, raw_value: str) -> bool:
     return False
 
 
-<<<<<<< ours
-def _filter_results(lines: List[str], l_value: str, w_value: str, file_name: str) -> List[SearchResult]:
-    results: List[SearchResult] = []
-    for index, line in enumerate(lines):
-        if _value_in_line(line, l_value) and _value_in_line(line, w_value):
-=======
 def _filter_results(
     lines: List[str],
     l_value: str,
@@ -178,6 +150,7 @@ def _filter_results(
     t_value: Optional[str],
     file_name: str,
 ) -> List[SearchResult]:
+
     results: List[SearchResult] = []
     t_value_normalized = (t_value or "").strip()
     t_required = bool(t_value_normalized)
@@ -188,7 +161,6 @@ def _filter_results(
             and _value_in_line(line, w_value)
             and (not t_required or _value_in_line(line, t_value_normalized))
         ):
->>>>>>> theirs
             part_number = _find_nearby_part_number(lines, index)
             results.append(
                 SearchResult(
@@ -200,24 +172,21 @@ def _filter_results(
     return results
 
 
+# --------------------------------------------------------------------
+# API endpoints
+# --------------------------------------------------------------------
 @app.post("/search")
 async def search_parts(
     files: List[UploadFile] = File(..., description="PDF files to search"),
     l_value: str = Form(..., description="Target L value"),
     w_value: str = Form(..., description="Target W value"),
-<<<<<<< ours
-=======
     t_value: Optional[str] = Form(None, description="Target T value"),
->>>>>>> theirs
     return_csv: bool = Form(False, description="If true, return a CSV file"),
 ):
     all_results: List[SearchResult] = []
 
     for upload in files:
         lines = list(_read_pdf_lines(upload))
-<<<<<<< ours
-        matches = _filter_results(lines, l_value, w_value, upload.filename or "unknown.pdf")
-=======
         matches = _filter_results(
             lines,
             l_value,
@@ -225,7 +194,6 @@ async def search_parts(
             t_value,
             upload.filename or "unknown.pdf",
         )
->>>>>>> theirs
         all_results.extend(matches)
 
     if return_csv:

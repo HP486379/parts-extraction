@@ -20,23 +20,18 @@ import SearchIcon from "@mui/icons-material/Search";
 import DownloadIcon from "@mui/icons-material/Download";
 import axios from "axios";
 
-<<<<<<< ours
-const toFormData = (files, lValue, wValue, returnCsv = false) => {
-=======
 const toFormData = (files, lValue, wValue, tValue, returnCsv = false) => {
->>>>>>> theirs
   const formData = new FormData();
   files.forEach((file) => {
     formData.append("files", file);
   });
   formData.append("l_value", lValue);
   formData.append("w_value", wValue);
-<<<<<<< ours
-=======
+
   if (tValue !== undefined && tValue !== null && `${tValue}`.length > 0) {
     formData.append("t_value", tValue);
   }
->>>>>>> theirs
+
   formData.append("return_csv", String(returnCsv));
   return formData;
 };
@@ -45,10 +40,7 @@ function App() {
   const [files, setFiles] = useState([]);
   const [lValue, setLValue] = useState("20");
   const [wValue, setWValue] = useState("4");
-<<<<<<< ours
-=======
   const [tValue, setTValue] = useState("2");
->>>>>>> theirs
   const [results, setResults] = useState([]);
   const [error, setError] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -101,11 +93,7 @@ function App() {
         if (returnCsv) {
           const response = await axios.post(
             "/api/search",
-<<<<<<< ours
-            toFormData(files, lValue, wValue, true),
-=======
             toFormData(files, lValue, wValue, tValue, true),
->>>>>>> theirs
             {
               responseType: "blob",
             }
@@ -123,13 +111,8 @@ function App() {
         } else {
           const response = await axios.post(
             "/api/search",
-<<<<<<< ours
-            toFormData(files, lValue, wValue)
-          );
-=======
             toFormData(files, lValue, wValue, tValue)
-        );
->>>>>>> theirs
+          );
           setResults(response.data);
         }
       } catch (err) {
@@ -143,11 +126,7 @@ function App() {
         }
       }
     },
-<<<<<<< ours
-    [files, lValue, wValue, isSearchDisabled]
-=======
     [files, lValue, wValue, tValue, isSearchDisabled]
->>>>>>> theirs
   );
 
   const handleSearch = async () => {
@@ -248,8 +227,6 @@ function App() {
               onChange={(event) => setWValue(event.target.value)}
               fullWidth
             />
-<<<<<<< ours
-=======
             <TextField
               label="T値 (厚み)"
               type="number"
@@ -258,7 +235,6 @@ function App() {
               fullWidth
               helperText="空欄の場合は L/W のみで検索します"
             />
->>>>>>> theirs
           </Stack>
 
           {error && <Alert severity="error">{error}</Alert>}
@@ -302,7 +278,9 @@ function App() {
                   results.map((row, index) => (
                     <TableRow key={`${row.file_name}-${index}`}>
                       <TableCell>{row.part_number}</TableCell>
-                      <TableCell sx={{ whiteSpace: "pre-wrap" }}>{row.matched_line}</TableCell>
+                      <TableCell sx={{ whiteSpace: "pre-wrap" }}>
+                        {row.matched_line}
+                      </TableCell>
                       <TableCell>{row.file_name}</TableCell>
                     </TableRow>
                   ))
