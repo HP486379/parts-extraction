@@ -6,6 +6,10 @@ import re
 from dataclasses import dataclass, asdict
 from typing import Iterable, List, Optional
 
+import cv2
+import numpy as np
+from pdf2image import convert_from_bytes
+from paddleocr import PaddleOCR
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
@@ -21,6 +25,22 @@ class SearchResult:
     part_number: str
     matched_line: str
     file_name: str
+
+
+@dataclass
+class OcrToken:
+    text: str
+    x_min: int
+    y_min: int
+    x_max: int
+    y_max: int
+
+
+@dataclass
+class OcrLine:
+    text: str
+    tokens: List[OcrToken]
+    part_number: str
 
 
 app = FastAPI(title="Parts Extraction API")
@@ -60,18 +80,155 @@ app.add_middleware(
 # PDF parsing patterns
 # --------------------------------------------------------------------
 PART_NUMBER_PATTERN = re.compile(r"(?=.*\d)[A-Za-z0-9\-_/]{3,}")
+OCR_PART_NUMBER_PATTERN = re.compile(r"\b[A-Z]{1,3}\d{4,6}\b", re.IGNORECASE)
 NUMBER_PATTERN = re.compile(r"-?\d+(?:\.\d+)?")
 
-def _read_pdf_lines(upload_file: UploadFile) -> Iterable[str]:
-    """Yield the text lines contained in ``upload_file``."""
-    data = upload_file.file.read()
-    upload_file.file.seek(0)
+OCR_ENGINE: Optional[PaddleOCR] = None
 
+
+def _get_ocr_engine() -> PaddleOCR:
+    global OCR_ENGINE
+    if OCR_ENGINE is None:
+        OCR_ENGINE = PaddleOCR(use_angle_cls=True, lang="japan", show_log=False)
+    return OCR_ENGINE
+
+
+def _read_pdf_lines_from_bytes(data: bytes) -> List[str]:
+    """Return text lines from a PDF byte stream."""
     reader = PdfReader(io.BytesIO(data))
+    lines: List[str] = []
     for page in reader.pages:
         text = page.extract_text() or ""
         for line in text.splitlines():
-            yield line.strip()
+            line_value = line.strip()
+            if line_value:
+                lines.append(line_value)
+    return lines
+
+
+def _convert_pdf_to_images(data: bytes, dpi: int = 300) -> List[np.ndarray]:
+    images = convert_from_bytes(data, dpi=dpi)
+    return [cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR) for image in images]
+
+
+def _detect_table_regions(image: np.ndarray) -> List[tuple[int, int, int, int]]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    binary = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_MEAN_C,
+        cv2.THRESH_BINARY_INV,
+        15,
+        10,
+    )
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
+    horizontal = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
+    vertical = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
+    table_mask = cv2.add(horizontal, vertical)
+    contours, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    height, width = image.shape[:2]
+    page_area = height * width
+    regions: List[tuple[int, int, int, int]] = []
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        area = w * h
+        if area < page_area * 0.02:
+            continue
+        if w < width * 0.15 or h < height * 0.08:
+            continue
+        if area > page_area * 0.95:
+            continue
+        regions.append((x, y, w, h))
+
+    if not regions:
+        regions.append((0, 0, width, height))
+
+    regions.sort(key=lambda region: (region[1], region[0]))
+    return regions
+
+
+def _extract_ocr_tokens(image: np.ndarray) -> List[OcrToken]:
+    ocr_engine = _get_ocr_engine()
+    results = ocr_engine.ocr(image, cls=True)
+    tokens: List[OcrToken] = []
+    if not results or not results[0]:
+        return tokens
+    for line in results[0]:
+        box, (text, _) = line
+        xs = [point[0] for point in box]
+        ys = [point[1] for point in box]
+        tokens.append(
+            OcrToken(
+                text=text.strip(),
+                x_min=int(min(xs)),
+                y_min=int(min(ys)),
+                x_max=int(max(xs)),
+                y_max=int(max(ys)),
+            )
+        )
+    return [token for token in tokens if token.text]
+
+
+def _group_tokens_by_line(tokens: List[OcrToken]) -> List[List[OcrToken]]:
+    if not tokens:
+        return []
+
+    heights = [token.y_max - token.y_min for token in tokens]
+    median_height = float(np.median(heights)) if heights else 10.0
+    threshold = max(8.0, median_height * 0.6)
+
+    sorted_tokens = sorted(tokens, key=lambda token: (token.y_min + token.y_max) / 2)
+    lines: List[List[OcrToken]] = []
+    current: List[OcrToken] = []
+    current_y: Optional[float] = None
+
+    for token in sorted_tokens:
+        y_center = (token.y_min + token.y_max) / 2
+        if current_y is None or abs(y_center - current_y) <= threshold:
+            current.append(token)
+            current_y = y_center if current_y is None else (current_y + y_center) / 2
+        else:
+            lines.append(current)
+            current = [token]
+            current_y = y_center
+
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _is_header_text(text: str) -> bool:
+    normalized = text.lower().replace(" ", "")
+    return "part" in normalized or "部品" in normalized
+
+
+def _extract_part_number_from_line(tokens: List[OcrToken], table_width: int) -> str:
+    if not tokens:
+        return ""
+    tokens_sorted = sorted(tokens, key=lambda token: token.x_min)
+    left_edge = tokens_sorted[0].x_min
+    left_limit = left_edge + max(20, int(table_width * 0.2))
+    candidates = [token for token in tokens_sorted if token.x_min <= left_limit]
+
+    for token in candidates:
+        if _is_header_text(token.text):
+            continue
+        match = OCR_PART_NUMBER_PATTERN.search(token.text)
+        if match:
+            return match.group(0)
+    return ""
+
+
+def _reconstruct_lines(tokens: List[OcrToken], table_width: int) -> List[OcrLine]:
+    lines: List[OcrLine] = []
+    for line_tokens in _group_tokens_by_line(tokens):
+        ordered = sorted(line_tokens, key=lambda token: token.x_min)
+        line_text = " ".join(token.text for token in ordered if token.text)
+        part_number = _extract_part_number_from_line(ordered, table_width)
+        lines.append(OcrLine(text=line_text, tokens=ordered, part_number=part_number))
+    return lines
 
 
 def _match_part_number(line: str) -> str:
@@ -172,6 +329,33 @@ def _filter_results(
     return results
 
 
+def _filter_results_from_ocr(
+    lines: List[OcrLine],
+    l_value: str,
+    w_value: str,
+    t_value: Optional[str],
+    file_name: str,
+) -> List[SearchResult]:
+    results: List[SearchResult] = []
+    t_value_normalized = (t_value or "").strip()
+    t_required = bool(t_value_normalized)
+
+    for line in lines:
+        if (
+            _value_in_line(line.text, l_value)
+            and _value_in_line(line.text, w_value)
+            and (not t_required or _value_in_line(line.text, t_value_normalized))
+        ):
+            results.append(
+                SearchResult(
+                    part_number=line.part_number or "(not found)",
+                    matched_line=line.text,
+                    file_name=file_name,
+                )
+            )
+    return results
+
+
 # --------------------------------------------------------------------
 # API endpoints
 # --------------------------------------------------------------------
@@ -186,13 +370,35 @@ async def search_parts(
     all_results: List[SearchResult] = []
 
     for upload in files:
-        lines = list(_read_pdf_lines(upload))
-        matches = _filter_results(
-            lines,
+        data = upload.file.read()
+        upload.file.seek(0)
+        file_name = upload.filename or "unknown.pdf"
+
+        # Entry point: decide between text-layer parsing and OCR-based extraction.
+        text_lines = _read_pdf_lines_from_bytes(data)
+        if text_lines:
+            matches = _filter_results(text_lines, l_value, w_value, t_value, file_name)
+            all_results.extend(matches)
+            continue
+
+        ocr_lines: List[OcrLine] = []
+        for image in _convert_pdf_to_images(data):
+            table_regions = _detect_table_regions(image)
+            tokens = _extract_ocr_tokens(image)
+            for x, y, w, h in table_regions:
+                tokens_in_table = [
+                    token
+                    for token in tokens
+                    if x <= token.x_min <= x + w and y <= token.y_min <= y + h
+                ]
+                ocr_lines.extend(_reconstruct_lines(tokens_in_table, w))
+
+        matches = _filter_results_from_ocr(
+            ocr_lines,
             l_value,
             w_value,
             t_value,
-            upload.filename or "unknown.pdf",
+            file_name,
         )
         all_results.extend(matches)
 

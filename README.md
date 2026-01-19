@@ -5,13 +5,8 @@
 ## 機能概要
 
 - 複数 PDF ファイルのアップロード
-<<<<<<< ours
-- L 値・W 値の数値入力
-- 条件に一致した行の検索およびテーブル表示（L/W 値の変更時は自動で再検索）
-=======
 - L 値・W 値・T 値の数値入力（T 値は任意指定）
 - 条件に一致した行の検索およびテーブル表示（条件変更時は自動で再検索）
->>>>>>> theirs
 - 検索結果の CSV ダウンロード
 - バックエンドとの通信は REST API 経由
 - アップロードしたファイルの個別削除が可能
@@ -35,6 +30,12 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
 
+#### OCR 依存関係
+
+- スキャン PDF 向け OCR は `pdf2image` + `PaddleOCR` を利用します。
+- macOS/Linux では `poppler` のインストールが必要です。
+  - 例: macOS `brew install poppler`, Ubuntu `sudo apt-get install poppler-utils`
+
 ### フロントエンド
 
 別のターミナルで次を実行します。
@@ -49,14 +50,10 @@ npm run dev
 
 ## API
 
-<<<<<<< ours
-- `POST /search`: PDF と L/W 値を受け取り、条件に一致する行を返します。
-=======
 - `POST /search`: PDF と L/W 値および任意の T 値を受け取り、条件に一致する行を返します。
->>>>>>> theirs
 - `POST /search` (return_csv=true): CSV 形式の結果を返します。
 - `GET /health`: ヘルスチェック用のエンドポイント。
 
 ## 注意事項
 
-PDF テキスト抽出には PyPDF2 を利用しています。PDF の構造によってはテキスト抽出結果が期待通りにならない場合があります。
+PDF テキスト抽出には PyPDF2、スキャン PDF には PaddleOCR を利用しています。PDF の構造や品質によっては抽出結果が期待通りにならない場合があります。
