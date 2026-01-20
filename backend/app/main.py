@@ -3,7 +3,8 @@ from __future__ import annotations
 import csv
 import io
 import re
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
+from datetime import datetime
 from typing import Iterable, List, Optional
 
 from fastapi import FastAPI, File, Form, UploadFile
@@ -72,6 +73,22 @@ def _read_pdf_lines(upload_file: UploadFile) -> Iterable[str]:
         text = page.extract_text() or ""
         for line in text.splitlines():
             yield line.strip()
+
+
+def _iter_pdf_text_lines(data: bytes) -> Iterable[tuple[int, int, str]]:
+    """
+    yield (page_number_1based, line_no_1based, text)
+    """
+    reader = PdfReader(io.BytesIO(data))
+    for page_index, page in enumerate(reader.pages, start=1):
+        text = page.extract_text() or ""
+        lines = [line.strip() for line in text.splitlines()]
+        line_no = 0
+        for line in lines:
+            if not line:
+                continue
+            line_no += 1
+            yield (page_index, line_no, line)
 
 
 def _match_part_number(line: str) -> str:
@@ -213,6 +230,36 @@ async def search_parts(
         )
 
     return JSONResponse([asdict(result) for result in all_results])
+
+
+@app.post("/extract_lines_csv")
+async def extract_lines_csv(
+    files: List[UploadFile] = File(...),
+):
+    """PDF全文抽出（行単位）をCSVで返す"""
+    async def generate():
+        yield "\ufeff".encode("utf-8")
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(["file_name", "page", "line_no", "text"])
+        yield buffer.getvalue().encode("utf-8")
+        buffer.seek(0)
+        buffer.truncate(0)
+
+        for upload in files:
+            pdf_bytes = await upload.read()
+            for page_no, line_no, text in _iter_pdf_text_lines(pdf_bytes):
+                writer.writerow(
+                    [upload.filename or "unknown.pdf", page_no, line_no, text]
+                )
+                yield buffer.getvalue().encode("utf-8")
+                buffer.seek(0)
+                buffer.truncate(0)
+
+    filename = f"pdf_lines_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(generate(), media_type="text/csv", headers=headers)
 
 
 @app.get("/health")
