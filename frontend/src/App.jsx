@@ -36,6 +36,14 @@ const toFormData = (files, lValue, wValue, tValue, returnCsv = false) => {
   return formData;
 };
 
+const toLinesCsvFormData = (files) => {
+  const formData = new FormData();
+  files.forEach((file) => {
+    formData.append("files", file);
+  });
+  return formData;
+};
+
 function App() {
   const [files, setFiles] = useState([]);
   const [lValue, setLValue] = useState("20");
@@ -50,6 +58,10 @@ function App() {
   const isSearchDisabled = useMemo(() => {
     return files.length === 0 || !lValue || !wValue;
   }, [files, lValue, wValue]);
+
+  const isLinesCsvDisabled = useMemo(() => {
+    return files.length === 0;
+  }, [files]);
 
   const handleFileChange = (event) => {
     const selectedFiles = Array.from(event.target.files || []);
@@ -143,7 +155,41 @@ function App() {
       return;
     }
 
-    await executeSearch({ returnCsv: true });
+    setError("");
+    try {
+      await executeSearch({ returnCsv: true });
+    } catch (err) {
+      setError(err.response?.data?.detail || "CSVダウンロードに失敗しました。");
+    }
+  };
+
+  const handleDownloadLinesCsv = async () => {
+    if (isLinesCsvDisabled) {
+      return;
+    }
+
+    setError("");
+    try {
+      const response = await axios.post(
+        "/api/extract_lines_csv",
+        toLinesCsvFormData(files),
+        {
+          responseType: "blob",
+        }
+      );
+
+      const blob = new Blob([response.data], { type: "text/csv" });
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.setAttribute("download", "pdf_lines.csv");
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      setError(err.response?.data?.detail || "PDF行CSVダウンロードに失敗しました。");
+    }
   };
 
   const handleClear = () => {
@@ -239,7 +285,7 @@ function App() {
 
           {error && <Alert severity="error">{error}</Alert>}
 
-          <Stack direction={{ xs: "column", sm: "row" }} spacing={2}>
+          <Stack direction={{ xs: "column", sm: "row" }} spacing={2} flexWrap="wrap">
             <Button
               variant="contained"
               startIcon={<SearchIcon />}
@@ -254,7 +300,15 @@ function App() {
               onClick={handleDownloadCsv}
               disabled={isSearchDisabled}
             >
-              CSVダウンロード
+              検索結果CSVダウンロード
+            </Button>
+            <Button
+              variant="outlined"
+              startIcon={<DownloadIcon />}
+              onClick={handleDownloadLinesCsv}
+              disabled={isLinesCsvDisabled}
+            >
+              PDF行CSVダウンロード
             </Button>
           </Stack>
 
