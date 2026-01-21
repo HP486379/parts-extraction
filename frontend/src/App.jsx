@@ -27,12 +27,19 @@ const toFormData = (files, lValue, wValue, tValue, returnCsv = false) => {
   });
   formData.append("l_value", lValue);
   formData.append("w_value", wValue);
-
-  if (tValue !== undefined && tValue !== null && `${tValue}`.length > 0) {
-    formData.append("t_value", tValue);
-  }
-
+  formData.append("t_value", tValue ?? "");
   formData.append("return_csv", String(returnCsv));
+  return formData;
+};
+
+const toPartsTableFormData = (files, lValue, wValue, tValue) => {
+  const formData = new FormData();
+  files.forEach((file) => {
+    formData.append("files", file);
+  });
+  formData.append("l_value", lValue ?? "");
+  formData.append("w_value", wValue ?? "");
+  formData.append("t_value", tValue ?? "");
   return formData;
 };
 
@@ -56,8 +63,8 @@ function App() {
   const fileInputRef = useRef(null);
 
   const isSearchDisabled = useMemo(() => {
-    return files.length === 0 || !lValue || !wValue;
-  }, [files, lValue, wValue]);
+    return files.length === 0;
+  }, [files]);
 
   const isLinesCsvDisabled = useMemo(() => {
     return files.length === 0;
@@ -122,10 +129,16 @@ function App() {
           window.URL.revokeObjectURL(url);
         } else {
           const response = await axios.post(
-            "/api/search",
-            toFormData(files, lValue, wValue, tValue)
+            "/api/extract_part_numbers_from_table",
+            toPartsTableFormData(files, lValue, wValue, tValue)
           );
-          setResults(response.data);
+          const flattened = response.data.flatMap((entry) =>
+            entry.part_numbers.map((partNumber) => ({
+              file_name: entry.file_name,
+              part_number: partNumber,
+            }))
+          );
+          setResults(flattened);
         }
       } catch (err) {
         setError(
@@ -150,14 +163,30 @@ function App() {
     setHasSearched(true);
   };
 
-  const handleDownloadCsv = async () => {
+  const handleDownloadPartsListCsv = async () => {
     if (isSearchDisabled) {
       return;
     }
 
     setError("");
     try {
-      await executeSearch({ returnCsv: true });
+      const response = await axios.post(
+        "/api/extract_parts_list_csv",
+        toPartsTableFormData(files, lValue, wValue, tValue),
+        {
+          responseType: "blob",
+        }
+      );
+
+      const blob = new Blob([response.data], { type: "text/csv" });
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.setAttribute("download", "parts_list.csv");
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
     } catch (err) {
       setError(err.response?.data?.detail || "CSVダウンロードに失敗しました。");
     }
@@ -297,10 +326,10 @@ function App() {
             <Button
               variant="outlined"
               startIcon={<DownloadIcon />}
-              onClick={handleDownloadCsv}
+              onClick={handleDownloadPartsListCsv}
               disabled={isSearchDisabled}
             >
-              検索結果CSVダウンロード
+              部品一覧CSVダウンロード
             </Button>
             <Button
               variant="outlined"
@@ -317,14 +346,13 @@ function App() {
               <TableHead>
                 <TableRow>
                   <TableCell>部品番号</TableCell>
-                  <TableCell>該当行</TableCell>
                   <TableCell>ファイル名</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
                 {results.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={3} align="center">
+                    <TableCell colSpan={2} align="center">
                       検索結果がここに表示されます。
                     </TableCell>
                   </TableRow>
@@ -332,9 +360,6 @@ function App() {
                   results.map((row, index) => (
                     <TableRow key={`${row.file_name}-${index}`}>
                       <TableCell>{row.part_number}</TableCell>
-                      <TableCell sx={{ whiteSpace: "pre-wrap" }}>
-                        {row.matched_line}
-                      </TableCell>
                       <TableCell>{row.file_name}</TableCell>
                     </TableRow>
                   ))
