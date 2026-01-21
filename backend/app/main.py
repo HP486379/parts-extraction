@@ -410,6 +410,59 @@ def _build_rows_from_side(side_df: pd.DataFrame, side_label: str) -> list[dict[s
     return rows
 
 
+def _to_float(value: Optional[str]) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if text == "":
+            return None
+        return float(text)
+    except Exception:
+        return None
+
+
+def _match_number(cell: str, target: Optional[float]) -> bool:
+    if target is None:
+        return True
+    value = _to_float(cell)
+    if value is None:
+        return False
+    return abs(value - target) < 1e-6
+
+
+def _match_text(cell: str, target: Optional[str]) -> bool:
+    if target is None:
+        return True
+    text = str(target).strip()
+    if text == "":
+        return True
+    return str(cell).strip() == text
+
+
+def _filter_rows(
+    rows: list[dict[str, str]],
+    l_value: Optional[str],
+    w_value: Optional[str],
+    t_value: Optional[str],
+) -> list[dict[str, str]]:
+    l_target = _to_float(l_value)
+    w_target = _to_float(w_value)
+    t_text = str(t_value).strip() if t_value is not None else ""
+    t_target = t_text if t_text != "" else None
+
+    filtered: list[dict[str, str]] = []
+    for row in rows:
+        if not _match_number(row.get("L_base", ""), l_target):
+            continue
+        if not _match_number(row.get("W_base", ""), w_target):
+            continue
+        if t_target is not None and not _match_text(row.get("T", ""), t_target):
+            continue
+        filtered.append(row)
+    return filtered
+
+
 def _filter_results(
     lines: List[str],
     l_value: str,
@@ -532,6 +585,9 @@ async def _extract_table_from_upload(upload: UploadFile) -> pd.DataFrame:
 @app.post("/extract_part_numbers_from_table")
 async def extract_part_numbers_from_table(
     files: List[UploadFile] = File(..., description="PDF files to extract part numbers"),
+    l_value: Optional[str] = Form(None),
+    w_value: Optional[str] = Form(None),
+    t_value: Optional[str] = Form(None),
 ):
     try:
         results: list[dict[str, object]] = []
@@ -539,19 +595,12 @@ async def extract_part_numbers_from_table(
             df = await _extract_table_from_upload(upload)
             left_df, right_df = _split_left_right_tables(df)
 
-            part_numbers: set[str] = set()
-            for side_df in [left_df, right_df]:
-                if side_df.empty:
-                    continue
-                header_index = _find_header_row_index(side_df)
-                data_df = side_df.iloc[header_index + 1 :].reset_index(drop=True)
-                if data_df.empty:
-                    continue
-                part_col = _find_part_column_index(data_df)
-                for value in data_df.iloc[:, part_col].astype(str).tolist():
-                    normalized = _normalize_cell(value)
-                    if TABLE_PART_NUMBER_PATTERN.fullmatch(normalized):
-                        part_numbers.add(normalized)
+            rows: list[dict[str, str]] = []
+            rows.extend(_build_rows_from_side(left_df, "Left"))
+            rows.extend(_build_rows_from_side(right_df, "Right"))
+            rows = _filter_rows(rows, l_value, w_value, t_value)
+
+            part_numbers: set[str] = {row["PART No."] for row in rows if row.get("PART No.")}
 
             result = {
                 "file_name": upload.filename or "unknown.pdf",
@@ -568,6 +617,9 @@ async def extract_part_numbers_from_table(
 @app.post("/extract_parts_list_csv")
 async def extract_parts_list_csv(
     files: List[UploadFile] = File(..., description="PDF files to extract parts list"),
+    l_value: Optional[str] = Form(None),
+    w_value: Optional[str] = Form(None),
+    t_value: Optional[str] = Form(None),
 ):
     try:
         all_rows: list[dict[str, str]] = []
@@ -577,6 +629,8 @@ async def extract_parts_list_csv(
 
             all_rows.extend(_build_rows_from_side(left_df, "Left"))
             all_rows.extend(_build_rows_from_side(right_df, "Right"))
+
+        all_rows = _filter_rows(all_rows, l_value, w_value, t_value)
 
         output = io.StringIO()
         writer = csv.writer(output, lineterminator="\n")

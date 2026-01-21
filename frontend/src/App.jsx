@@ -17,16 +17,30 @@ import {
   Typography,
 } from "@mui/material";
 
-/**
- * 目的（A仕様）:
- *  - 検索: PDFアップロード → PART No. 抽出(JSON) → 画面表示
- *  - CSV:  PDFアップロード → parts_list.csv 生成 → ダウンロード
- *
- * 注意:
- *  - L/W/T入力欄は現状未使用（表抽出の動作確認を最優先にするため）
- */
+const toFormData = (files, lValue, wValue, tValue, returnCsv = false) => {
+  const formData = new FormData();
+  files.forEach((file) => {
+    formData.append("files", file);
+  });
+  formData.append("l_value", lValue);
+  formData.append("w_value", wValue);
+  formData.append("t_value", tValue ?? "");
+  formData.append("return_csv", String(returnCsv));
+  return formData;
+};
 
-const toFilesFormData = (files) => {
+const toPartsTableFormData = (files, lValue, wValue, tValue) => {
+  const formData = new FormData();
+  files.forEach((file) => {
+    formData.append("files", file);
+  });
+  formData.append("l_value", lValue ?? "");
+  formData.append("w_value", wValue ?? "");
+  formData.append("t_value", tValue ?? "");
+  return formData;
+};
+
+const toLinesCsvFormData = (files) => {
   const formData = new FormData();
   files.forEach((file) => formData.append("files", file));
   return formData;
@@ -40,10 +54,9 @@ function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
 
-  // 既存UIを残しているだけ（現状未使用）
-  const [lValue, setLValue] = useState("");
-  const [wValue, setWValue] = useState("");
-  const [tValue, setTValue] = useState("");
+  const isSearchDisabled = useMemo(() => {
+    return files.length === 0;
+  }, [files]);
 
   const isSearchDisabled = useMemo(() => files.length === 0 || isLoading, [files, isLoading]);
   const isCsvDisabled = useMemo(() => files.length === 0 || isLoading, [files, isLoading]);
@@ -69,11 +82,62 @@ function App() {
     e.target.value = "";
   };
 
-  const handleClear = () => {
-    setFiles([]);
-    setResults([]);
-    setError("");
-  };
+  const executeSearch = useCallback(
+    async ({ returnCsv = false, silent = false } = {}) => {
+      if (isSearchDisabled) {
+        return;
+      }
+
+      if (!returnCsv && !silent) {
+        setIsLoading(true);
+      }
+      setError("");
+
+      try {
+        if (returnCsv) {
+          const response = await axios.post(
+            "/api/search",
+            toFormData(files, lValue, wValue, tValue, true),
+            {
+              responseType: "blob",
+            }
+          );
+
+          const blob = new Blob([response.data], { type: "text/csv" });
+          const url = window.URL.createObjectURL(blob);
+          const link = document.createElement("a");
+          link.href = url;
+          link.setAttribute("download", "search_results.csv");
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+          window.URL.revokeObjectURL(url);
+        } else {
+          const response = await axios.post(
+            "/api/extract_part_numbers_from_table",
+            toPartsTableFormData(files, lValue, wValue, tValue)
+          );
+          const flattened = response.data.flatMap((entry) =>
+            entry.part_numbers.map((partNumber) => ({
+              file_name: entry.file_name,
+              part_number: partNumber,
+            }))
+          );
+          setResults(flattened);
+        }
+      } catch (err) {
+        setError(
+          err.response?.data?.detail ||
+            (returnCsv ? "CSVダウンロードに失敗しました。" : "検索中にエラーが発生しました。")
+        );
+      } finally {
+        if (!returnCsv && !silent) {
+          setIsLoading(false);
+        }
+      }
+    },
+    [files, lValue, wValue, tValue, isSearchDisabled]
+  );
 
   const handleRemoveFile = (idx) => {
     setFiles((prev) => prev.filter((_, i) => i !== idx));
@@ -90,9 +154,10 @@ function App() {
     window.URL.revokeObjectURL(url);
   };
 
-  // A) PART No. 抽出
-  const handleSearch = useCallback(async () => {
-    if (isSearchDisabled) return;
+  const handleDownloadPartsListCsv = async () => {
+    if (isSearchDisabled) {
+      return;
+    }
 
     setIsLoading(true);
     setError("");
@@ -100,32 +165,22 @@ function App() {
 
     try {
       const response = await axios.post(
-        "/api/extract_part_numbers_from_table",
-        toFilesFormData(files)
+        "/api/extract_parts_list_csv",
+        toPartsTableFormData(files, lValue, wValue, tValue),
+        {
+          responseType: "blob",
+        }
       );
 
-      // backend は
-      // [
-      //   { file_name, count, part_numbers: [...] },
-      //   ...
-      // ]
-      const rows =
-        (response.data || []).flatMap((r) =>
-          (r.part_numbers || []).map((p) => ({
-            part_number: p,
-            file_name: r.file_name,
-          }))
-        ) || [];
-
-      // 表示を安定させるためソート（PART No → file_name）
-      rows.sort((a, b) => {
-        const pa = String(a.part_number || "");
-        const pb = String(b.part_number || "");
-        if (pa !== pb) return pa.localeCompare(pb);
-        return String(a.file_name || "").localeCompare(String(b.file_name || ""));
-      });
-
-      setResults(rows);
+      const blob = new Blob([response.data], { type: "text/csv" });
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.setAttribute("download", "parts_list.csv");
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
     } catch (err) {
       setError(err?.response?.data?.detail || "PART No. 抽出に失敗しました。");
     } finally {
@@ -224,9 +279,17 @@ function App() {
             <Button
               variant="contained"
               onClick={handleSearch}
+              disabled={isSearchDisabled || isLoading}
+            >
+              {isLoading ? "検索中..." : "検索"}
+            </Button>
+            <Button
+              variant="outlined"
+              startIcon={<DownloadIcon />}
+              onClick={handleDownloadPartsListCsv}
               disabled={isSearchDisabled}
             >
-              {isLoading ? "処理中..." : "検索（PART No.抽出）"}
+              部品一覧CSVダウンロード
             </Button>
 
             <Button
@@ -247,17 +310,15 @@ function App() {
             <Table size="small">
               <TableHead>
                 <TableRow>
-                  <TableCell sx={{ fontWeight: "bold" }}>PART No.</TableCell>
-                  <TableCell sx={{ fontWeight: "bold" }}>ファイル名</TableCell>
+                  <TableCell>部品番号</TableCell>
+                  <TableCell>ファイル名</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
                 {results.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={2} sx={{ color: "text.secondary" }}>
-                      {files.length === 0
-                        ? "PDFを選択してください。"
-                        : "まだ結果がありません。（検索ボタンを押してください）"}
+                    <TableCell colSpan={2} align="center">
+                      検索結果がここに表示されます。
                     </TableCell>
                   </TableRow>
                 ) : (
