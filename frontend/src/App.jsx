@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
+import axios from "axios";
 import {
   Alert,
   Button,
@@ -15,10 +16,6 @@ import {
   TextField,
   Typography,
 } from "@mui/material";
-import CloudUploadIcon from "@mui/icons-material/CloudUpload";
-import SearchIcon from "@mui/icons-material/Search";
-import DownloadIcon from "@mui/icons-material/Download";
-import axios from "axios";
 
 const toFormData = (files, lValue, wValue, tValue, returnCsv = false) => {
   const formData = new FormData();
@@ -45,56 +42,44 @@ const toPartsTableFormData = (files, lValue, wValue, tValue) => {
 
 const toLinesCsvFormData = (files) => {
   const formData = new FormData();
-  files.forEach((file) => {
-    formData.append("files", file);
-  });
+  files.forEach((file) => formData.append("files", file));
   return formData;
 };
 
 function App() {
-  const [files, setFiles] = useState([]);
-  const [lValue, setLValue] = useState("20");
-  const [wValue, setWValue] = useState("4");
-  const [tValue, setTValue] = useState("2");
-  const [results, setResults] = useState([]);
-  const [error, setError] = useState("");
-  const [isLoading, setIsLoading] = useState(false);
-  const [hasSearched, setHasSearched] = useState(false);
   const fileInputRef = useRef(null);
+
+  const [files, setFiles] = useState([]);
+  const [results, setResults] = useState([]); // { part_number, file_name }
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState("");
 
   const isSearchDisabled = useMemo(() => {
     return files.length === 0;
   }, [files]);
 
-  const isLinesCsvDisabled = useMemo(() => {
-    return files.length === 0;
-  }, [files]);
+  const isSearchDisabled = useMemo(() => files.length === 0 || isLoading, [files, isLoading]);
+  const isCsvDisabled = useMemo(() => files.length === 0 || isLoading, [files, isLoading]);
 
-  const handleFileChange = (event) => {
-    const selectedFiles = Array.from(event.target.files || []);
-    if (selectedFiles.length === 0) {
-      return;
-    }
+  const handlePickFiles = () => fileInputRef.current?.click();
 
+  const handleFileChange = (e) => {
+    const selected = Array.from(e.target.files || []);
+    if (!selected.length) return;
+
+    // 同名＋サイズ＋更新時刻で重複排除
     setFiles((prev) => {
-      const existingSignatures = new Set(
-        prev.map((file) => `${file.name}-${file.size}-${file.lastModified}`)
-      );
-      const merged = [
-        ...prev,
-        ...selectedFiles.filter((file) => {
-          const signature = `${file.name}-${file.size}-${file.lastModified}`;
-          return !existingSignatures.has(signature);
-        }),
-      ];
+      const existing = new Set(prev.map((f) => `${f.name}-${f.size}-${f.lastModified}`));
+      const merged = [...prev];
+      for (const f of selected) {
+        const key = `${f.name}-${f.size}-${f.lastModified}`;
+        if (!existing.has(key)) merged.push(f);
+      }
       return merged;
     });
 
-    setHasSearched(false);
-
-    if (fileInputRef.current) {
-      fileInputRef.current.value = "";
-    }
+    // 同じファイルを再選択できるように
+    e.target.value = "";
   };
 
   const executeSearch = useCallback(
@@ -154,13 +139,19 @@ function App() {
     [files, lValue, wValue, tValue, isSearchDisabled]
   );
 
-  const handleSearch = async () => {
-    if (isSearchDisabled) {
-      return;
-    }
+  const handleRemoveFile = (idx) => {
+    setFiles((prev) => prev.filter((_, i) => i !== idx));
+  };
 
-    await executeSearch();
-    setHasSearched(true);
+  const downloadBlob = (blob, filename) => {
+    const url = window.URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.setAttribute("download", filename);
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.URL.revokeObjectURL(url);
   };
 
   const handleDownloadPartsListCsv = async () => {
@@ -168,7 +159,10 @@ function App() {
       return;
     }
 
+    setIsLoading(true);
     setError("");
+    setResults([]);
+
     try {
       const response = await axios.post(
         "/api/extract_parts_list_csv",
@@ -188,136 +182,102 @@ function App() {
       link.remove();
       window.URL.revokeObjectURL(url);
     } catch (err) {
-      setError(err.response?.data?.detail || "CSVダウンロードに失敗しました。");
+      setError(err?.response?.data?.detail || "PART No. 抽出に失敗しました。");
+    } finally {
+      setIsLoading(false);
     }
-  };
+  }, [files, isSearchDisabled]);
 
-  const handleDownloadLinesCsv = async () => {
-    if (isLinesCsvDisabled) {
-      return;
-    }
+  // B) parts_list.csv ダウンロード
+  const handleDownloadPartsListCsv = useCallback(async () => {
+    if (isCsvDisabled) return;
 
     setError("");
     try {
       const response = await axios.post(
-        "/api/extract_lines_csv",
-        toLinesCsvFormData(files),
-        {
-          responseType: "blob",
-        }
+        "/api/extract_parts_list_csv",
+        toFilesFormData(files),
+        { responseType: "blob" }
       );
 
       const blob = new Blob([response.data], { type: "text/csv" });
-      const url = window.URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.setAttribute("download", "pdf_lines.csv");
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.URL.revokeObjectURL(url);
+      downloadBlob(blob, "parts_list.csv");
     } catch (err) {
-      setError(err.response?.data?.detail || "PDF行CSVダウンロードに失敗しました。");
+      setError(err?.response?.data?.detail || "parts_list.csv の生成/ダウンロードに失敗しました。");
     }
-  };
-
-  const handleClear = () => {
-    setFiles([]);
-    setResults([]);
-    setError("");
-    setHasSearched(false);
-    if (fileInputRef.current) {
-      fileInputRef.current.value = "";
-    }
-  };
-
-  const handleRemoveFile = (indexToRemove) => {
-    setFiles((prev) => prev.filter((_, index) => index !== indexToRemove));
-    setHasSearched(false);
-  };
-
-  useEffect(() => {
-    if (!hasSearched) {
-      return;
-    }
-    executeSearch({ silent: true });
-  }, [executeSearch, hasSearched]);
+  }, [files, isCsvDisabled]);
 
   return (
     <Container maxWidth="md" sx={{ py: 4 }}>
-      <Paper elevation={3} sx={{ p: 4 }}>
-        <Stack spacing={3}>
-          <Typography variant="h4" component="h1">
+      <Paper elevation={3} sx={{ p: 3 }}>
+        <Stack spacing={2}>
+          <Typography variant="h5" fontWeight="bold">
             部品番号抽出ツール
           </Typography>
 
-          <Stack direction={{ xs: "column", sm: "row" }} spacing={2} alignItems="center">
-            <Button
-              variant="contained"
-              component="label"
-              startIcon={<CloudUploadIcon />}
-            >
+          {error && <Alert severity="error">{error}</Alert>}
+
+          <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="application/pdf"
+              multiple
+              style={{ display: "none" }}
+              onChange={handleFileChange}
+            />
+            <Button variant="contained" onClick={handlePickFiles} disabled={isLoading}>
               PDFファイルを選択
-              <input
-                ref={fileInputRef}
-                type="file"
-                hidden
-                multiple
-                accept="application/pdf"
-                onChange={handleFileChange}
-              />
             </Button>
-            <Button variant="outlined" onClick={handleClear}>
+            <Button variant="outlined" onClick={handleClear} disabled={isLoading}>
               クリア
             </Button>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{ ml: 1 }}>
               選択中: {files.length} 件
             </Typography>
           </Stack>
 
           {files.length > 0 && (
             <Stack direction="row" spacing={1} flexWrap="wrap">
-              {files.map((file, index) => (
+              {files.map((f, idx) => (
                 <Chip
-                  key={`${file.name}-${file.lastModified}-${index}`}
-                  label={file.name}
-                  onDelete={() => handleRemoveFile(index)}
+                  key={`${f.name}-${f.size}-${f.lastModified}`}
+                  label={f.name}
+                  onDelete={() => handleRemoveFile(idx)}
+                  sx={{ mb: 1 }}
                 />
               ))}
             </Stack>
           )}
 
+          {/* 既存UIを残す（現状未使用） */}
           <Stack direction={{ xs: "column", sm: "row" }} spacing={2}>
             <TextField
               label="L値"
-              type="number"
               value={lValue}
-              onChange={(event) => setLValue(event.target.value)}
+              onChange={(e) => setLValue(e.target.value)}
               fullWidth
+              helperText="※現在この入力は未使用（表ベース抽出の動作確認を優先）"
             />
             <TextField
               label="W値"
-              type="number"
               value={wValue}
-              onChange={(event) => setWValue(event.target.value)}
+              onChange={(e) => setWValue(e.target.value)}
               fullWidth
+              helperText="※現在この入力は未使用"
             />
             <TextField
-              label="T値 (厚み)"
-              type="number"
+              label="T値（厚み）"
               value={tValue}
-              onChange={(event) => setTValue(event.target.value)}
+              onChange={(e) => setTValue(e.target.value)}
               fullWidth
-              helperText="空欄の場合は L/W のみで検索します"
+              helperText="※現在この入力は未使用"
             />
           </Stack>
 
-          {error && <Alert severity="error">{error}</Alert>}
-
-          <Stack direction={{ xs: "column", sm: "row" }} spacing={2} flexWrap="wrap">
+          <Stack direction="row" spacing={2} flexWrap="wrap">
             <Button
               variant="contained"
-              startIcon={<SearchIcon />}
               onClick={handleSearch}
               disabled={isSearchDisabled || isLoading}
             >
@@ -331,17 +291,22 @@ function App() {
             >
               部品一覧CSVダウンロード
             </Button>
+
             <Button
               variant="outlined"
-              startIcon={<DownloadIcon />}
-              onClick={handleDownloadLinesCsv}
-              disabled={isLinesCsvDisabled}
+              onClick={handleDownloadPartsListCsv}
+              disabled={isCsvDisabled}
             >
-              PDF行CSVダウンロード
+              parts_list.csvダウンロード
+            </Button>
+
+            {/* 旧「PDF行CSV」は今回は無効化（必要なら復活させます） */}
+            <Button variant="outlined" disabled>
+              PDF行CSVダウンロード（未使用）
             </Button>
           </Stack>
 
-          <TableContainer component={Paper} variant="outlined">
+          <TableContainer sx={{ mt: 1 }}>
             <Table size="small">
               <TableHead>
                 <TableRow>
@@ -357,8 +322,8 @@ function App() {
                     </TableCell>
                   </TableRow>
                 ) : (
-                  results.map((row, index) => (
-                    <TableRow key={`${row.file_name}-${index}`}>
+                  results.map((row, i) => (
+                    <TableRow key={`${row.part_number}-${row.file_name}-${i}`}>
                       <TableCell>{row.part_number}</TableCell>
                       <TableCell>{row.file_name}</TableCell>
                     </TableRow>
