@@ -3,12 +3,17 @@ from __future__ import annotations
 import csv
 import io
 import re
+import tempfile
+import os
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Iterable, List, Optional
 
+import camelot
+import pandas as pd
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
@@ -62,6 +67,7 @@ app.add_middleware(
 # --------------------------------------------------------------------
 PART_NUMBER_PATTERN = re.compile(r"(?=.*\d)[A-Za-z0-9\-_/]{3,}")
 NUMBER_PATTERN = re.compile(r"-?\d+(?:\.\d+)?")
+TABLE_PART_NUMBER_PATTERN = re.compile(r"^[A-Z]{2,}\d{3,}$")
 
 def _read_pdf_lines(upload_file: UploadFile) -> Iterable[str]:
     """Yield the text lines contained in ``upload_file``."""
@@ -158,6 +164,250 @@ def _value_in_line(line: str, raw_value: str) -> bool:
             continue
 
     return False
+
+
+def _normalize_cell(value: str) -> str:
+    normalized = value.strip()
+    if normalized.upper() in {"<NA>", "NA", "N/A"}:
+        return ""
+    return normalized
+
+
+def _normalize_header(value: str) -> str:
+    return re.sub(r"\s+", "", value.strip().upper())
+
+
+def _is_dim_header(header: str, token: str) -> bool:
+    if not header:
+        return False
+    if header == token:
+        return True
+    if header in {f"{token}MM", f"{token}(MM)", f"{token}寸法", f"{token}寸"}:
+        return True
+    return header.startswith(f"{token}(") or header.startswith(f"{token}寸")
+
+
+def _split_dimension(value: str) -> tuple[str, str]:
+    normalized = _normalize_cell(value)
+    if not normalized:
+        return "", ""
+    match = re.match(r"^\s*([0-9.]+)\s*±\s*([0-9.]+)\s*$", normalized)
+    if match:
+        return match.group(1), match.group(2)
+    return normalized, ""
+
+
+def _extract_main_table(pdf_path: str) -> pd.DataFrame:
+    tables = camelot.read_pdf(
+        pdf_path,
+        pages="1",
+        flavor="lattice",
+        strip_text="\n",
+    )
+    if not tables:
+        raise ValueError("No tables found in PDF.")
+
+    best_table = max(
+        tables,
+        key=lambda table: table.df.shape[0] * table.df.shape[1],
+    )
+    df = best_table.df.copy()
+    return df.applymap(lambda value: value.strip() if isinstance(value, str) else value)
+
+
+def _column_match_counts(df: pd.DataFrame) -> list[int]:
+    counts: list[int] = []
+    for column in df.columns:
+        values = df[column].astype(str).fillna("")
+        counts.append(
+            sum(
+                1
+                for value in values
+                if TABLE_PART_NUMBER_PATTERN.fullmatch(value.strip())
+            )
+        )
+    return counts
+
+
+def _split_left_right_tables(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    counts = _column_match_counts(df)
+    if not counts or max(counts) == 0:
+        return df, pd.DataFrame()
+
+    ranked = sorted(
+        [(index, count) for index, count in enumerate(counts)],
+        key=lambda item: (-item[1], item[0]),
+    )
+    part_columns = [ranked[0][0]]
+    if len(ranked) > 1 and ranked[1][1] > 0:
+        part_columns.append(ranked[1][0])
+
+    part_columns = sorted(part_columns)
+    if len(part_columns) < 2:
+        return df, pd.DataFrame()
+
+    split_index = part_columns[1]
+    left = df.iloc[:, :split_index]
+    right = df.iloc[:, split_index:]
+    return left, right
+
+
+def _find_header_row_index(df: pd.DataFrame) -> int:
+    for idx, row in df.iterrows():
+        for cell in row:
+            if isinstance(cell, str) and re.search(r"part", cell, re.IGNORECASE):
+                return idx
+    return 0
+
+
+def _find_part_column_index(df: pd.DataFrame) -> int:
+    counts = _column_match_counts(df)
+    if not counts:
+        return 0
+    return max(range(len(counts)), key=lambda index: counts[index])
+
+
+def _find_column_by_keywords(headers: list[str], keywords: list[str]) -> Optional[int]:
+    for idx, header in enumerate(headers):
+        normalized = _normalize_header(header)
+        if any(keyword in normalized for keyword in keywords):
+            return idx
+    return None
+
+
+def _cleanup_and_correct_fields(
+    manufacturer: str,
+    catalog_name: str,
+    other: str,
+) -> tuple[str, str, str]:
+    manufacturer = _normalize_cell(manufacturer)
+    catalog_name = _normalize_cell(catalog_name)
+    other = _normalize_cell(other)
+
+    def looks_like_manufacturer(value: str) -> bool:
+        if not value:
+            return False
+        if re.search(r"\d", value):
+            return False
+        return bool(re.match(r"^[A-Z0-9 &./()-]+$", value, re.IGNORECASE))
+
+    def looks_like_spec(value: str) -> bool:
+        return bool(re.search(r"\d", value)) or any(token in value.upper() for token in ["SPEC", "UL", "ROHS"])
+
+    if not manufacturer and looks_like_manufacturer(catalog_name):
+        manufacturer, catalog_name = catalog_name, ""
+    if not manufacturer and looks_like_manufacturer(other):
+        manufacturer, other = other, ""
+
+    if not catalog_name and other:
+        if looks_like_spec(other) and not looks_like_manufacturer(other):
+            catalog_name, other = other, ""
+
+    return manufacturer, catalog_name, other
+
+
+def _build_rows_from_side(side_df: pd.DataFrame, side_label: str) -> list[dict[str, str]]:
+    if side_df.empty:
+        return []
+
+    header_index = _find_header_row_index(side_df)
+    headers = [str(value) if value is not None else "" for value in side_df.iloc[header_index].tolist()]
+    data_df = side_df.iloc[header_index + 1 :].reset_index(drop=True)
+    if data_df.empty:
+        return []
+
+    part_col_index = _find_part_column_index(data_df)
+
+    total_columns = len(headers)
+    item_col = _find_column_by_keywords(headers, ["ITEM", "品名"])
+    manufacturer_col = _find_column_by_keywords(headers, ["MANUFACTURER", "MAKER", "メーカー"])
+    catalog_col = _find_column_by_keywords(headers, ["CATALOG", "CATALOGNAME", "CATNO", "型番"])
+    color_col = _find_column_by_keywords(headers, ["COLOR", "色"])
+    adhesion_col = _find_column_by_keywords(headers, ["ADHESION", "ADHESIONTYPE", "粘着"])
+    other_col = _find_column_by_keywords(headers, ["OTHER", "備考", "REMARK"])
+
+    l_col = None
+    w_col = None
+    t_col = None
+    for idx, header in enumerate(headers):
+        normalized = _normalize_header(header)
+        if l_col is None and _is_dim_header(normalized, "L"):
+            l_col = idx
+        if w_col is None and _is_dim_header(normalized, "W"):
+            w_col = idx
+        if t_col is None and _is_dim_header(normalized, "T"):
+            t_col = idx
+
+    column_map = {
+        "item_col": item_col,
+        "l_col": l_col,
+        "w_col": w_col,
+        "t_col": t_col,
+        "manufacturer_col": manufacturer_col,
+        "catalog_col": catalog_col,
+        "color_col": color_col,
+        "adhesion_col": adhesion_col,
+        "other_col": other_col,
+    }
+    next_index = part_col_index + 1
+    for key, value in column_map.items():
+        if value is None and next_index < total_columns:
+            column_map[key] = next_index
+            next_index += 1
+
+    item_col = column_map["item_col"]
+    l_col = column_map["l_col"]
+    w_col = column_map["w_col"]
+    t_col = column_map["t_col"]
+    manufacturer_col = column_map["manufacturer_col"]
+    catalog_col = column_map["catalog_col"]
+    color_col = column_map["color_col"]
+    adhesion_col = column_map["adhesion_col"]
+    other_col = column_map["other_col"]
+
+    rows: list[dict[str, str]] = []
+    for _, row in data_df.iterrows():
+        part_number = _normalize_cell(str(row.iloc[part_col_index]) if part_col_index < len(row) else "")
+        if not TABLE_PART_NUMBER_PATTERN.fullmatch(part_number):
+            continue
+
+        item = _normalize_cell(str(row.iloc[item_col]) if item_col is not None and item_col < len(row) else "")
+        l_raw = _normalize_cell(str(row.iloc[l_col]) if l_col is not None and l_col < len(row) else "")
+        w_raw = _normalize_cell(str(row.iloc[w_col]) if w_col is not None and w_col < len(row) else "")
+        t_value = _normalize_cell(str(row.iloc[t_col]) if t_col is not None and t_col < len(row) else "")
+        manufacturer = _normalize_cell(str(row.iloc[manufacturer_col]) if manufacturer_col is not None and manufacturer_col < len(row) else "")
+        catalog_name = _normalize_cell(str(row.iloc[catalog_col]) if catalog_col is not None and catalog_col < len(row) else "")
+        color = _normalize_cell(str(row.iloc[color_col]) if color_col is not None and color_col < len(row) else "")
+        adhesion_type = _normalize_cell(str(row.iloc[adhesion_col]) if adhesion_col is not None and adhesion_col < len(row) else "")
+        other = _normalize_cell(str(row.iloc[other_col]) if other_col is not None and other_col < len(row) else "")
+
+        manufacturer, catalog_name, other = _cleanup_and_correct_fields(
+            manufacturer,
+            catalog_name,
+            other,
+        )
+
+        l_base, l_tol = _split_dimension(l_raw)
+        w_base, w_tol = _split_dimension(w_raw)
+
+        rows.append(
+            {
+                "Side": side_label,
+                "PART No.": part_number,
+                "Item": item,
+                "L_base": l_base,
+                "L_tol": l_tol,
+                "W_base": w_base,
+                "W_tol": w_tol,
+                "T": t_value,
+                "MANUFACTURER": manufacturer,
+                "CATALOG NAME": catalog_name,
+                "Color": color,
+                "Adhesion TYPE": adhesion_type,
+                "Other": other,
+            }
+        )
+    return rows
 
 
 def _filter_results(
@@ -260,6 +510,107 @@ async def extract_lines_csv(
     filename = f"pdf_lines_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     return StreamingResponse(generate(), media_type="text/csv", headers=headers)
+
+
+async def _extract_table_from_upload(upload: UploadFile) -> pd.DataFrame:
+    suffix = Path(upload.filename or "upload.pdf").suffix or ".pdf"
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            temp_path = tmp.name
+            tmp.write(await upload.read())
+
+        return _extract_main_table(temp_path)
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+
+@app.post("/extract_part_numbers_from_table")
+async def extract_part_numbers_from_table(
+    files: List[UploadFile] = File(..., description="PDF files to extract part numbers"),
+):
+    try:
+        results: list[dict[str, object]] = []
+        for upload in files:
+            df = await _extract_table_from_upload(upload)
+            left_df, right_df = _split_left_right_tables(df)
+
+            part_numbers: set[str] = set()
+            for side_df in [left_df, right_df]:
+                if side_df.empty:
+                    continue
+                header_index = _find_header_row_index(side_df)
+                data_df = side_df.iloc[header_index + 1 :].reset_index(drop=True)
+                if data_df.empty:
+                    continue
+                part_col = _find_part_column_index(data_df)
+                for value in data_df.iloc[:, part_col].astype(str).tolist():
+                    normalized = _normalize_cell(value)
+                    if TABLE_PART_NUMBER_PATTERN.fullmatch(normalized):
+                        part_numbers.add(normalized)
+
+            result = {
+                "file_name": upload.filename or "unknown.pdf",
+                "count": len(part_numbers),
+                "part_numbers": sorted(part_numbers),
+            }
+            results.append(result)
+
+        return JSONResponse(results)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/extract_parts_list_csv")
+async def extract_parts_list_csv(
+    files: List[UploadFile] = File(..., description="PDF files to extract parts list"),
+):
+    try:
+        all_rows: list[dict[str, str]] = []
+        for upload in files:
+            df = await _extract_table_from_upload(upload)
+            left_df, right_df = _split_left_right_tables(df)
+
+            all_rows.extend(_build_rows_from_side(left_df, "Left"))
+            all_rows.extend(_build_rows_from_side(right_df, "Right"))
+
+        output = io.StringIO()
+        writer = csv.writer(output, lineterminator="\n")
+        headers = [
+            "Side",
+            "PART No.",
+            "Item",
+            "L_base",
+            "L_tol",
+            "W_base",
+            "W_tol",
+            "T",
+            "MANUFACTURER",
+            "CATALOG NAME",
+            "Color",
+            "Adhesion TYPE",
+            "Other",
+        ]
+        writer.writerow(headers)
+        for row in all_rows:
+            writer.writerow([row.get(header, "") for header in headers])
+
+        filename = "parts_list.csv"
+        if len(files) > 1:
+            filename = f"parts_list_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+
+        csv_bytes = output.getvalue().encode("utf-8-sig")
+        return StreamingResponse(
+            iter([csv_bytes]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/health")
