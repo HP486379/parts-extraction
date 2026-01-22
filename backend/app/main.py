@@ -3,12 +3,17 @@ from __future__ import annotations
 import csv
 import io
 import re
+import tempfile
+import os
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Iterable, List, Optional
 
+import camelot
+import pandas as pd
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
@@ -62,6 +67,7 @@ app.add_middleware(
 # --------------------------------------------------------------------
 PART_NUMBER_PATTERN = re.compile(r"(?=.*\d)[A-Za-z0-9\-_/]{3,}")
 NUMBER_PATTERN = re.compile(r"-?\d+(?:\.\d+)?")
+TABLE_PART_NUMBER_PATTERN = re.compile(r"^[A-Z]{2,}\d{3,}$")
 
 def _read_pdf_lines(upload_file: UploadFile) -> Iterable[str]:
     """Yield the text lines contained in ``upload_file``."""
@@ -158,6 +164,377 @@ def _value_in_line(line: str, raw_value: str) -> bool:
             continue
 
     return False
+
+
+def _normalize_cell(value: str) -> str:
+    if value is None:
+        return ""
+    text = str(value).replace("\u00a0", " ").replace("\n", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+    if text.lower() in {"nan", "none", "null"}:
+        return ""
+    if text.upper() in {"<NA>", "NA", "N/A"}:
+        return ""
+    return text
+
+
+def _normalize_header(value: str) -> str:
+    return re.sub(r"\s+", "", value.strip().upper())
+
+
+def _is_dim_header(header: str, token: str) -> bool:
+    if not header:
+        return False
+    if header == token:
+        return True
+    if header in {f"{token}MM", f"{token}(MM)", f"{token}寸法", f"{token}寸"}:
+        return True
+    return header.startswith(f"{token}(") or header.startswith(f"{token}寸")
+
+
+def _split_dimension(value: str) -> tuple[str, str]:
+    normalized = _normalize_cell(value)
+    if not normalized:
+        return "", ""
+    match = re.match(r"^\s*([0-9.]+)\s*±\s*([0-9.]+)\s*$", normalized)
+    if match:
+        return match.group(1), match.group(2)
+    return normalized, ""
+
+
+def _extract_main_table(pdf_path: str) -> pd.DataFrame:
+    """
+    Extracts table(s) from the PDF using Camelot.
+    NOTE: This PDF has two independent tables per page (left/right),
+    and Camelot often returns them as separate tables, so keep ALL.
+    """
+    reader = PdfReader(pdf_path)
+    page_nums = ",".join(str(i + 1) for i in range(len(reader.pages)))
+
+    tables = camelot.read_pdf(
+        pdf_path,
+        pages=page_nums,
+        flavor="lattice",
+        strip_text="\n",
+    )
+    if not tables:
+        raise ValueError("No tables found in PDF.")
+
+    dfs: list[pd.DataFrame] = []
+    for table in tables:
+        df = table.df
+        if df is None or df.empty:
+            continue
+        df = df.replace(r"^\s*$", "", regex=True)
+        joined = " ".join(df.astype(str).fillna("").values.flatten().tolist()).upper()
+        if ("PART" not in joined) and ("部品" not in joined) and ("NO" not in joined):
+            continue
+        dfs.append(df)
+
+    if not dfs:
+        raise ValueError("No usable tables found in PDF.")
+
+    merged = pd.concat(dfs, ignore_index=True)
+    return merged.applymap(lambda value: value.strip() if isinstance(value, str) else value)
+
+
+def _extract_left_right_tables(pdf_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    reader = PdfReader(pdf_path)
+    page_nums = ",".join(str(i + 1) for i in range(len(reader.pages)))
+    tables = camelot.read_pdf(
+        pdf_path,
+        pages=page_nums,
+        flavor="lattice",
+        strip_text="\n",
+    )
+    dfs: list[pd.DataFrame] = []
+    for table in tables:
+        df = table.df
+        if df is None or df.empty:
+            continue
+        df = df.replace(r"^\s*$", "", regex=True)
+        joined = " ".join(df.astype(str).fillna("").values.flatten().tolist()).upper()
+        if ("PART" not in joined) and ("部品" not in joined) and ("NO" not in joined):
+            continue
+        dfs.append(df)
+
+    if not dfs:
+        raise ValueError("No tables found in PDF.")
+
+    left_df = dfs[0].copy()
+    right_df = pd.concat(dfs[1:], ignore_index=True) if len(dfs) > 1 else pd.DataFrame()
+    return left_df, right_df
+
+
+def _column_match_counts(df: pd.DataFrame) -> list[int]:
+    counts: list[int] = []
+    for column in df.columns:
+        values = df[column].astype(str).fillna("")
+        counts.append(
+            sum(
+                1
+                for value in values
+                if TABLE_PART_NUMBER_PATTERN.fullmatch(value.strip())
+            )
+        )
+    return counts
+
+
+
+
+def _find_header_row_index(df: pd.DataFrame) -> int:
+    for idx, row in df.iterrows():
+        for cell in row:
+            if isinstance(cell, str) and re.search(r"part", cell, re.IGNORECASE):
+                return idx
+    return 0
+
+
+def _find_part_column_index(df: pd.DataFrame) -> int:
+    counts = _column_match_counts(df)
+    if not counts:
+        return 0
+    return max(range(len(counts)), key=lambda index: counts[index])
+
+
+def _find_column_by_keywords(headers: list[str], keywords: list[str]) -> Optional[int]:
+    for idx, header in enumerate(headers):
+        normalized = _normalize_header(header)
+        if any(keyword in normalized for keyword in keywords):
+            return idx
+    return None
+
+
+def _cleanup_and_correct_fields(
+    manufacturer: str,
+    catalog_name: str,
+    other: str,
+) -> tuple[str, str, str]:
+    manufacturer = _normalize_cell(manufacturer)
+    catalog_name = _normalize_cell(catalog_name)
+    other = _normalize_cell(other)
+
+    def looks_like_manufacturer(value: str) -> bool:
+        if not value:
+            return False
+        if re.search(r"\d", value):
+            return False
+        return bool(re.match(r"^[A-Z0-9 &./()-]+$", value, re.IGNORECASE))
+
+    def looks_like_spec(value: str) -> bool:
+        return bool(re.search(r"\d", value)) or any(token in value.upper() for token in ["SPEC", "UL", "ROHS"])
+
+    def looks_like_catalog(value: str) -> bool:
+        if not value:
+            return False
+        pattern = (
+            r"(?:PEF|SOFTLON|30\s*TIMES|EXPANDED|30010|30020|30030|"
+            r"ペフ|ソフトロン|発泡|ポリエチレン)"
+        )
+        return re.search(pattern, value, flags=re.IGNORECASE) is not None
+
+    def looks_like_manufacturer_name(value: str) -> bool:
+        if not value:
+            return False
+        pattern = (
+            r"(?:TORAY|SEKISUI|CHEMICAL|INDUSTRIES|INC\.?|LTD\.?|CO\.?|"
+            r"株式会社|有限会社|工業|産業|製作所|商事|上海|天津|道和順)"
+        )
+        return re.search(pattern, value, flags=re.IGNORECASE) is not None or looks_like_manufacturer(value)
+
+    if (
+        not manufacturer
+        or manufacturer.upper() == "<NA>"
+    ) and looks_like_manufacturer_name(catalog_name) and looks_like_catalog(other):
+        manufacturer, catalog_name, other = catalog_name, other, ""
+
+    if not manufacturer and looks_like_manufacturer(catalog_name):
+        manufacturer, catalog_name = catalog_name, ""
+    if not manufacturer and looks_like_manufacturer(other):
+        manufacturer, other = other, ""
+
+    if not catalog_name and other:
+        if looks_like_spec(other) and not looks_like_manufacturer(other):
+            catalog_name, other = other, ""
+
+    return manufacturer, catalog_name, other
+
+
+def _build_rows_from_side(
+    side_df: pd.DataFrame,
+    side_label: str,
+    *,
+    fixed_layout: bool = False,
+) -> list[dict[str, str]]:
+    if side_df.empty:
+        return []
+
+    header_index = _find_header_row_index(side_df)
+    headers = [str(value) if value is not None else "" for value in side_df.iloc[header_index].tolist()]
+    data_df = side_df.iloc[header_index + 1 :].reset_index(drop=True)
+    if data_df.empty:
+        return []
+
+    part_col_index = _find_part_column_index(data_df)
+
+    total_columns = len(headers)
+    item_col = _find_column_by_keywords(headers, ["ITEM", "品名"])
+    manufacturer_col = _find_column_by_keywords(headers, ["MANUFACTURER", "MAKER", "メーカー"])
+    catalog_col = _find_column_by_keywords(headers, ["CATALOG", "CATALOGNAME", "CATNO", "型番"])
+    color_col = _find_column_by_keywords(headers, ["COLOR", "色"])
+    adhesion_col = _find_column_by_keywords(headers, ["ADHESION", "ADHESIONTYPE", "粘着"])
+    other_col = _find_column_by_keywords(headers, ["OTHER", "備考", "REMARK"])
+
+    l_col = None
+    w_col = None
+    t_col = None
+    for idx, header in enumerate(headers):
+        normalized = _normalize_header(header)
+        if l_col is None and _is_dim_header(normalized, "L"):
+            l_col = idx
+        if w_col is None and _is_dim_header(normalized, "W"):
+            w_col = idx
+        if t_col is None and _is_dim_header(normalized, "T"):
+            t_col = idx
+
+    if fixed_layout:
+        item_col = part_col_index + 1
+        l_col = part_col_index + 2
+        w_col = part_col_index + 3
+        t_col = part_col_index + 4
+        manufacturer_col = part_col_index + 5
+        catalog_col = part_col_index + 6
+        color_col = part_col_index + 7
+        adhesion_col = part_col_index + 8
+        other_col = part_col_index + 9
+        if other_col >= total_columns:
+            other_col = total_columns - 1
+    else:
+        column_map = {
+            "item_col": item_col,
+            "l_col": l_col,
+            "w_col": w_col,
+            "t_col": t_col,
+            "manufacturer_col": manufacturer_col,
+            "catalog_col": catalog_col,
+            "color_col": color_col,
+            "adhesion_col": adhesion_col,
+            "other_col": other_col,
+        }
+        next_index = part_col_index + 1
+        for key, value in column_map.items():
+            if value is None and next_index < total_columns:
+                column_map[key] = next_index
+                next_index += 1
+
+        item_col = column_map["item_col"]
+        l_col = column_map["l_col"]
+        w_col = column_map["w_col"]
+        t_col = column_map["t_col"]
+        manufacturer_col = column_map["manufacturer_col"]
+        catalog_col = column_map["catalog_col"]
+        color_col = column_map["color_col"]
+        adhesion_col = column_map["adhesion_col"]
+        other_col = column_map["other_col"]
+
+    rows: list[dict[str, str]] = []
+    for _, row in data_df.iterrows():
+        part_number = _normalize_cell(str(row.iloc[part_col_index]) if part_col_index < len(row) else "")
+        if not TABLE_PART_NUMBER_PATTERN.fullmatch(part_number):
+            continue
+
+        item = _normalize_cell(str(row.iloc[item_col]) if item_col is not None and item_col < len(row) else "")
+        l_raw = _normalize_cell(str(row.iloc[l_col]) if l_col is not None and l_col < len(row) else "")
+        w_raw = _normalize_cell(str(row.iloc[w_col]) if w_col is not None and w_col < len(row) else "")
+        t_value = _normalize_cell(str(row.iloc[t_col]) if t_col is not None and t_col < len(row) else "")
+        manufacturer = _normalize_cell(str(row.iloc[manufacturer_col]) if manufacturer_col is not None and manufacturer_col < len(row) else "")
+        catalog_name = _normalize_cell(str(row.iloc[catalog_col]) if catalog_col is not None and catalog_col < len(row) else "")
+        color = _normalize_cell(str(row.iloc[color_col]) if color_col is not None and color_col < len(row) else "")
+        adhesion_type = _normalize_cell(str(row.iloc[adhesion_col]) if adhesion_col is not None and adhesion_col < len(row) else "")
+        other = _normalize_cell(str(row.iloc[other_col]) if other_col is not None and other_col < len(row) else "")
+
+        manufacturer, catalog_name, other = _cleanup_and_correct_fields(
+            manufacturer,
+            catalog_name,
+            other,
+        )
+
+        l_base, l_tol = _split_dimension(l_raw)
+        w_base, w_tol = _split_dimension(w_raw)
+
+        rows.append(
+            {
+                "Side": side_label,
+                "PART No.": part_number,
+                "Item": item,
+                "L_base": l_base,
+                "L_tol": l_tol,
+                "W_base": w_base,
+                "W_tol": w_tol,
+                "T": t_value,
+                "MANUFACTURER": manufacturer,
+                "CATALOG NAME": catalog_name,
+                "Color": color,
+                "Adhesion TYPE": adhesion_type,
+                "Other": other,
+            }
+        )
+    return rows
+
+
+def _to_float(value: Optional[str]) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if text == "":
+            return None
+        return float(text)
+    except Exception:
+        return None
+
+
+def _match_number(cell: str, target: Optional[float]) -> bool:
+    if target is None:
+        return True
+    value = _to_float(cell)
+    if value is None:
+        return False
+    return abs(value - target) < 1e-6
+
+
+def _match_text(cell: str, target: Optional[str]) -> bool:
+    if target is None:
+        return True
+    text = str(target).strip()
+    if text == "":
+        return True
+    return str(cell).strip() == text
+
+
+def _filter_rows(
+    rows: list[dict[str, str]],
+    l_value: Optional[str],
+    w_value: Optional[str],
+    t_value: Optional[str],
+) -> list[dict[str, str]]:
+    l_target = _to_float(l_value)
+    w_target = _to_float(w_value)
+    t_text = str(t_value).strip() if t_value is not None else ""
+    t_target = t_text if t_text != "" else None
+
+    filtered: list[dict[str, str]] = []
+    for row in rows:
+        if not _match_number(row.get("L_base", ""), l_target):
+            continue
+        if not _match_number(row.get("W_base", ""), w_target):
+            continue
+        if t_target is not None and not _match_text(row.get("T", ""), t_target):
+            continue
+        filtered.append(row)
+    return filtered
 
 
 def _filter_results(
@@ -260,6 +637,106 @@ async def extract_lines_csv(
     filename = f"pdf_lines_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     return StreamingResponse(generate(), media_type="text/csv", headers=headers)
+
+
+async def _extract_table_from_upload(upload: UploadFile) -> tuple[pd.DataFrame, pd.DataFrame]:
+    suffix = Path(upload.filename or "upload.pdf").suffix or ".pdf"
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            temp_path = tmp.name
+            tmp.write(await upload.read())
+
+        return _extract_left_right_tables(temp_path)
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+
+@app.post("/extract_part_numbers_from_table")
+async def extract_part_numbers_from_table(
+    files: List[UploadFile] = File(..., description="PDF files to extract part numbers"),
+    l_value: Optional[str] = Form(None),
+    w_value: Optional[str] = Form(None),
+    t_value: Optional[str] = Form(None),
+):
+    try:
+        results: list[dict[str, object]] = []
+        for upload in files:
+            left_df, right_df = await _extract_table_from_upload(upload)
+
+            rows: list[dict[str, str]] = []
+            rows.extend(_build_rows_from_side(left_df, "Left"))
+            rows.extend(_build_rows_from_side(right_df, "Right", fixed_layout=True))
+            rows = _filter_rows(rows, l_value, w_value, t_value)
+
+            part_numbers: set[str] = {row["PART No."] for row in rows if row.get("PART No.")}
+
+            result = {
+                "file_name": upload.filename or "unknown.pdf",
+                "count": len(part_numbers),
+                "part_numbers": sorted(part_numbers),
+            }
+            results.append(result)
+
+        return JSONResponse(results)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/extract_parts_list_csv")
+async def extract_parts_list_csv(
+    files: List[UploadFile] = File(..., description="PDF files to extract parts list"),
+    l_value: Optional[str] = Form(None),
+    w_value: Optional[str] = Form(None),
+    t_value: Optional[str] = Form(None),
+):
+    try:
+        all_rows: list[dict[str, str]] = []
+        for upload in files:
+            left_df, right_df = await _extract_table_from_upload(upload)
+
+            all_rows.extend(_build_rows_from_side(left_df, "Left"))
+            all_rows.extend(_build_rows_from_side(right_df, "Right", fixed_layout=True))
+
+        all_rows = _filter_rows(all_rows, l_value, w_value, t_value)
+
+        output = io.StringIO()
+        writer = csv.writer(output, lineterminator="\n")
+        headers = [
+            "Side",
+            "PART No.",
+            "Item",
+            "L_base",
+            "L_tol",
+            "W_base",
+            "W_tol",
+            "T",
+            "MANUFACTURER",
+            "CATALOG NAME",
+            "Color",
+            "Adhesion TYPE",
+            "Other",
+        ]
+        writer.writerow(headers)
+        for row in all_rows:
+            writer.writerow([row.get(header, "") for header in headers])
+
+        filename = "parts_list.csv"
+        if len(files) > 1:
+            filename = f"parts_list_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+
+        csv_bytes = output.getvalue().encode("utf-8-sig")
+        return StreamingResponse(
+            iter([csv_bytes]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/health")
