@@ -17,33 +17,16 @@ import {
   Typography,
 } from "@mui/material";
 
-const toFormData = (files, lValue, wValue, tValue, returnCsv = false) => {
-  const formData = new FormData();
-  files.forEach((file) => {
-    formData.append("files", file);
-  });
-  formData.append("l_value", lValue);
-  formData.append("w_value", wValue);
-  formData.append("t_value", tValue ?? "");
-  formData.append("return_csv", String(returnCsv));
-  return formData;
-};
+const buildFormData = (files, lValue, wValue, tValue) => {
+  const form = new FormData();
+  files.forEach((f) => form.append("files", f));
 
-const toPartsTableFormData = (files, lValue, wValue, tValue) => {
-  const formData = new FormData();
-  files.forEach((file) => {
-    formData.append("files", file);
-  });
-  formData.append("l_value", lValue ?? "");
-  formData.append("w_value", wValue ?? "");
-  formData.append("t_value", tValue ?? "");
-  return formData;
-};
+  // 送る（バック側で空文字は無視する前提）
+  form.append("l_value", lValue ?? "");
+  form.append("w_value", wValue ?? "");
+  form.append("t_value", tValue ?? "");
 
-const toLinesCsvFormData = (files) => {
-  const formData = new FormData();
-  files.forEach((file) => formData.append("files", file));
-  return formData;
+  return form;
 };
 
 function App() {
@@ -54,12 +37,18 @@ function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
 
-  const isSearchDisabled = useMemo(() => {
-    return files.length === 0;
-  }, [files]);
+  const [lValue, setLValue] = useState("");
+  const [wValue, setWValue] = useState("");
+  const [tValue, setTValue] = useState("");
 
-  const isSearchDisabled = useMemo(() => files.length === 0 || isLoading, [files, isLoading]);
-  const isCsvDisabled = useMemo(() => files.length === 0 || isLoading, [files, isLoading]);
+  const isSearchDisabled = useMemo(
+    () => files.length === 0 || isLoading,
+    [files.length, isLoading]
+  );
+  const isCsvDisabled = useMemo(
+    () => files.length === 0 || isLoading,
+    [files.length, isLoading]
+  );
 
   const handlePickFiles = () => fileInputRef.current?.click();
 
@@ -67,77 +56,25 @@ function App() {
     const selected = Array.from(e.target.files || []);
     if (!selected.length) return;
 
-    // 同名＋サイズ＋更新時刻で重複排除
     setFiles((prev) => {
-      const existing = new Set(prev.map((f) => `${f.name}-${f.size}-${f.lastModified}`));
+      const keyOf = (f) => `${f.name}-${f.size}-${f.lastModified}`;
+      const exist = new Set(prev.map(keyOf));
       const merged = [...prev];
       for (const f of selected) {
-        const key = `${f.name}-${f.size}-${f.lastModified}`;
-        if (!existing.has(key)) merged.push(f);
+        const k = keyOf(f);
+        if (!exist.has(k)) merged.push(f);
       }
       return merged;
     });
 
-    // 同じファイルを再選択できるように
     e.target.value = "";
   };
 
-  const executeSearch = useCallback(
-    async ({ returnCsv = false, silent = false } = {}) => {
-      if (isSearchDisabled) {
-        return;
-      }
-
-      if (!returnCsv && !silent) {
-        setIsLoading(true);
-      }
-      setError("");
-
-      try {
-        if (returnCsv) {
-          const response = await axios.post(
-            "/api/search",
-            toFormData(files, lValue, wValue, tValue, true),
-            {
-              responseType: "blob",
-            }
-          );
-
-          const blob = new Blob([response.data], { type: "text/csv" });
-          const url = window.URL.createObjectURL(blob);
-          const link = document.createElement("a");
-          link.href = url;
-          link.setAttribute("download", "search_results.csv");
-          document.body.appendChild(link);
-          link.click();
-          link.remove();
-          window.URL.revokeObjectURL(url);
-        } else {
-          const response = await axios.post(
-            "/api/extract_part_numbers_from_table",
-            toPartsTableFormData(files, lValue, wValue, tValue)
-          );
-          const flattened = response.data.flatMap((entry) =>
-            entry.part_numbers.map((partNumber) => ({
-              file_name: entry.file_name,
-              part_number: partNumber,
-            }))
-          );
-          setResults(flattened);
-        }
-      } catch (err) {
-        setError(
-          err.response?.data?.detail ||
-            (returnCsv ? "CSVダウンロードに失敗しました。" : "検索中にエラーが発生しました。")
-        );
-      } finally {
-        if (!returnCsv && !silent) {
-          setIsLoading(false);
-        }
-      }
-    },
-    [files, lValue, wValue, tValue, isSearchDisabled]
-  );
+  const handleClear = () => {
+    setFiles([]);
+    setResults([]);
+    setError("");
+  };
 
   const handleRemoveFile = (idx) => {
     setFiles((prev) => prev.filter((_, i) => i !== idx));
@@ -145,67 +82,69 @@ function App() {
 
   const downloadBlob = (blob, filename) => {
     const url = window.URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.setAttribute("download", filename);
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
     window.URL.revokeObjectURL(url);
   };
 
-  const handleDownloadPartsListCsv = async () => {
-    if (isSearchDisabled) {
-      return;
-    }
+  // A) PART No. 抽出（L/W/Tで絞る）
+  const handleSearch = useCallback(async () => {
+    if (isSearchDisabled) return;
 
     setIsLoading(true);
     setError("");
     setResults([]);
 
     try {
-      const response = await axios.post(
-        "/api/extract_parts_list_csv",
-        toPartsTableFormData(files, lValue, wValue, tValue),
-        {
-          responseType: "blob",
-        }
-      );
+      const form = buildFormData(files, lValue, wValue, tValue);
 
-      const blob = new Blob([response.data], { type: "text/csv" });
-      const url = window.URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.setAttribute("download", "parts_list.csv");
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.URL.revokeObjectURL(url);
+      const res = await axios.post("/api/extract_part_numbers_from_table", form);
+
+      const rows =
+        (res.data || []).flatMap((r) =>
+          (r.part_numbers || []).map((p) => ({
+            part_number: p,
+            file_name: r.file_name,
+          }))
+        ) || [];
+
+      rows.sort((a, b) => {
+        const pa = String(a.part_number || "");
+        const pb = String(b.part_number || "");
+        if (pa !== pb) return pa.localeCompare(pb);
+        return String(a.file_name || "").localeCompare(String(b.file_name || ""));
+      });
+
+      setResults(rows);
     } catch (err) {
       setError(err?.response?.data?.detail || "PART No. 抽出に失敗しました。");
     } finally {
       setIsLoading(false);
     }
-  }, [files, isSearchDisabled]);
+  }, [files, lValue, wValue, tValue, isSearchDisabled]);
 
-  // B) parts_list.csv ダウンロード
+  // B) parts_list.csv ダウンロード（同じ条件で絞る）
   const handleDownloadPartsListCsv = useCallback(async () => {
     if (isCsvDisabled) return;
 
     setError("");
-    try {
-      const response = await axios.post(
-        "/api/extract_parts_list_csv",
-        toFilesFormData(files),
-        { responseType: "blob" }
-      );
 
-      const blob = new Blob([response.data], { type: "text/csv" });
-      downloadBlob(blob, "parts_list.csv");
+    try {
+      const form = buildFormData(files, lValue, wValue, tValue);
+
+      const res = await axios.post("/api/extract_parts_list_csv", form, {
+        responseType: "blob",
+      });
+
+      downloadBlob(new Blob([res.data], { type: "text/csv" }), "parts_list.csv");
     } catch (err) {
-      setError(err?.response?.data?.detail || "parts_list.csv の生成/ダウンロードに失敗しました。");
+      setError(err?.response?.data?.detail || "parts_list.csv の取得に失敗しました。");
     }
-  }, [files, isCsvDisabled]);
+  }, [files, lValue, wValue, tValue, isCsvDisabled]);
 
   return (
     <Container maxWidth="md" sx={{ py: 4 }}>
@@ -232,9 +171,7 @@ function App() {
             <Button variant="outlined" onClick={handleClear} disabled={isLoading}>
               クリア
             </Button>
-            <Typography variant="body2" sx={{ ml: 1 }}>
-              選択中: {files.length} 件
-            </Typography>
+            <Typography variant="body2">選択中: {files.length} 件</Typography>
           </Stack>
 
           {files.length > 0 && (
@@ -250,57 +187,21 @@ function App() {
             </Stack>
           )}
 
-          {/* 既存UIを残す（現状未使用） */}
           <Stack direction={{ xs: "column", sm: "row" }} spacing={2}>
-            <TextField
-              label="L値"
-              value={lValue}
-              onChange={(e) => setLValue(e.target.value)}
-              fullWidth
-              helperText="※現在この入力は未使用（表ベース抽出の動作確認を優先）"
-            />
-            <TextField
-              label="W値"
-              value={wValue}
-              onChange={(e) => setWValue(e.target.value)}
-              fullWidth
-              helperText="※現在この入力は未使用"
-            />
-            <TextField
-              label="T値（厚み）"
-              value={tValue}
-              onChange={(e) => setTValue(e.target.value)}
-              fullWidth
-              helperText="※現在この入力は未使用"
-            />
+            <TextField label="L値" value={lValue} onChange={(e) => setLValue(e.target.value)} fullWidth />
+            <TextField label="W値" value={wValue} onChange={(e) => setWValue(e.target.value)} fullWidth />
+            <TextField label="T値（厚み）" value={tValue} onChange={(e) => setTValue(e.target.value)} fullWidth />
           </Stack>
 
           <Stack direction="row" spacing={2} flexWrap="wrap">
-            <Button
-              variant="contained"
-              onClick={handleSearch}
-              disabled={isSearchDisabled || isLoading}
-            >
-              {isLoading ? "検索中..." : "検索"}
-            </Button>
-            <Button
-              variant="outlined"
-              startIcon={<DownloadIcon />}
-              onClick={handleDownloadPartsListCsv}
-              disabled={isSearchDisabled}
-            >
-              部品一覧CSVダウンロード
+            <Button variant="contained" onClick={handleSearch} disabled={isSearchDisabled}>
+              {isLoading ? "処理中..." : "検索（PART NO.抽出）"}
             </Button>
 
-            <Button
-              variant="outlined"
-              onClick={handleDownloadPartsListCsv}
-              disabled={isCsvDisabled}
-            >
-              parts_list.csvダウンロード
+            <Button variant="outlined" onClick={handleDownloadPartsListCsv} disabled={isCsvDisabled}>
+              PARTS_LIST.CSVダウンロード
             </Button>
 
-            {/* 旧「PDF行CSV」は今回は無効化（必要なら復活させます） */}
             <Button variant="outlined" disabled>
               PDF行CSVダウンロード（未使用）
             </Button>
@@ -310,22 +211,24 @@ function App() {
             <Table size="small">
               <TableHead>
                 <TableRow>
-                  <TableCell>部品番号</TableCell>
-                  <TableCell>ファイル名</TableCell>
+                  <TableCell sx={{ fontWeight: "bold" }}>PART No.</TableCell>
+                  <TableCell sx={{ fontWeight: "bold" }}>ファイル名</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
                 {results.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={2} align="center">
-                      検索結果がここに表示されます。
+                    <TableCell colSpan={2} sx={{ color: "text.secondary" }}>
+                      {files.length === 0
+                        ? "PDFを選択してください。"
+                        : "まだ結果がありません。（検索ボタンを押してください）"}
                     </TableCell>
                   </TableRow>
                 ) : (
-                  results.map((row, i) => (
-                    <TableRow key={`${row.part_number}-${row.file_name}-${i}`}>
-                      <TableCell>{row.part_number}</TableCell>
-                      <TableCell>{row.file_name}</TableCell>
+                  results.map((r, i) => (
+                    <TableRow key={`${r.part_number}-${r.file_name}-${i}`}>
+                      <TableCell>{r.part_number}</TableCell>
+                      <TableCell>{r.file_name}</TableCell>
                     </TableRow>
                   ))
                 )}
