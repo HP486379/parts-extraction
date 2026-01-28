@@ -1,672 +1,577 @@
 from __future__ import annotations
 
-import csv
-import io
-import re
-import tempfile
 import os
-from dataclasses import asdict, dataclass
-from datetime import datetime
-from typing import Iterable, List, Optional
+import re
+import math
+import json
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
-import camelot
 import pandas as pd
-from fastapi import FastAPI, File, Form, UploadFile
+import numpy as np
+import camelot
+
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
-from pathlib import Path
-import sys
-
-from PyPDF2 import PdfReader
+from pydantic import BaseModel, Field
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 
 
-@dataclass
-class SearchResult:
-    part_number: str
-    matched_line: str
-    file_name: str
+# ======================
+# FastAPI
+# ======================
 
-
-app = FastAPI(title="Parts Extraction API")
-
-
-# --------------------------------------------------------------------
-# Frontend dist auto detect (for packaged app or dev)
-# --------------------------------------------------------------------
-if getattr(sys, "frozen", False):
-    BASE_DIR = Path(sys.executable).parent
-else:
-    BASE_DIR = Path(__file__).resolve().parent.parent
-
-FRONTEND_DIST = BASE_DIR / "frontend_dist"
-
-if FRONTEND_DIST.exists():
-    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
-
-    @app.get("/", include_in_schema=False)
-    async def index():
-        return FileResponse(FRONTEND_DIST / "index.html")
-
-
-# --------------------------------------------------------------------
-# CORS
-# --------------------------------------------------------------------
+app = FastAPI(title="Parts Extractor API (Tkinter-logic port)")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ======================
+# Patterns (ゆるく拾う)
+# ======================
 
-# --------------------------------------------------------------------
-# PDF parsing patterns
-# --------------------------------------------------------------------
-PART_NUMBER_PATTERN = re.compile(r"(?=.*\d)[A-Za-z0-9\-_/]{3,}")
-NUMBER_PATTERN = re.compile(r"-?\d+(?:\.\d+)?")
-TABLE_PART_NUMBER_PATTERN = re.compile(r"^[A-Z]{2,}\d{3,}$")
+# 部品番号：ハイフン/スラッシュ/英数字/末尾枝番などを許容（fullmatchしない）
+# 例: "ABC-123", "12-3456-78", "A12B-3", "12345", "X-12/34"
+PART_NO_LOOSE = re.compile(r"[A-Z0-9][A-Z0-9\-\/]*[A-Z0-9]", re.IGNORECASE)
 
-def _read_pdf_lines(upload_file: UploadFile) -> Iterable[str]:
-    """Yield the text lines contained in ``upload_file``."""
-    data = upload_file.file.read()
-    upload_file.file.seek(0)
+# L/W/Tっぽい数値：2, 2.0, 2.00, 2mm, t=2 など
+NUM_LOOSE = re.compile(r"[-+]?\d+(?:\.\d+)?")
 
-    reader = PdfReader(io.BytesIO(data))
-    for page in reader.pages:
-        text = page.extract_text() or ""
-        for line in text.splitlines():
-            yield line.strip()
+# ヘッダ推定：依存しすぎない（補助として使う）
+HDR_L = re.compile(r"^(?:L|LENGTH|長さ)\b", re.IGNORECASE)
+HDR_W = re.compile(r"^(?:W|WIDTH|幅)\b", re.IGNORECASE)
+HDR_T = re.compile(r"^(?:T|THK|THICK|厚|厚み)\b", re.IGNORECASE)
+HDR_PART = re.compile(r"(?:品番|部品|PART\s*NO|PART\s*NUMBER)", re.IGNORECASE)
 
 
-def _iter_pdf_text_lines(data: bytes) -> Iterable[tuple[int, int, str]]:
-    """
-    yield (page_number_1based, line_no_1based, text)
-    """
-    reader = PdfReader(io.BytesIO(data))
-    for page_index, page in enumerate(reader.pages, start=1):
-        text = page.extract_text() or ""
-        lines = [line.strip() for line in text.splitlines()]
-        line_no = 0
-        for line in lines:
-            if not line:
-                continue
-            line_no += 1
-            yield (page_index, line_no, line)
+# ======================
+# Request/Response Models
+# ======================
+
+class SearchRequest(BaseModel):
+    pdf_path: str = Field(..., description="サーバ上のPDFパス（ローカルパス/マウントパス）")
+    # ページ指定（Noneなら全部）
+    pages: Optional[str] = Field(None, description='例: "1,2,3" or "1-3"')
+    # 左右分割（比率）
+    split_ratio: float = Field(0.5, ge=0.2, le=0.8, description="ページ幅に対する左右境界の比率")
+    # flavor: stream/lattice/auto
+    flavor: str = Field("auto", description='camelot flavor: "auto"|"stream"|"lattice"')
+    # フィルタ（数値比較）
+    L: Optional[float] = None
+    W: Optional[float] = None
+    T: Optional[float] = None
+    tol: float = Field(0.05, ge=0.0, le=1.0, description="数値比較の許容差（相対）")
+
+class PartRow(BaseModel):
+    part_no: str
+    L: Optional[float] = None
+    W: Optional[float] = None
+    T: Optional[float] = None
+    raw: Dict[str, Any] = Field(default_factory=dict)
+
+class SearchResponse(BaseModel):
+    items: List[PartRow]
+    debug: Dict[str, Any]
 
 
-def _match_part_number(line: str) -> str:
-    tokens = re.split(r"\s+", line.strip())
-    for raw_token in tokens:
-        token = raw_token.strip(".,;:()[]{}")
-        if PART_NUMBER_PATTERN.fullmatch(token):
-            return token
+# ======================
+# Core: Normalization
+# ======================
 
-    match = PART_NUMBER_PATTERN.search(line)
-    return match.group(0) if match else ""
-
-
-def _find_nearby_part_number(lines: List[str], index: int) -> str:
-    """Locate a part number around ``index``."""
-    candidate = _match_part_number(lines[index])
-    if candidate:
-        return candidate
-
-    # Look backward
-    for offset in range(1, 4):
-        prev_index = index - offset
-        if prev_index < 0:
-            break
-        prev_line = lines[prev_index]
-        if not prev_line.strip():
-            break
-        candidate = _match_part_number(prev_line)
-        if candidate:
-            return candidate
-
-    # Look forward
-    for offset in range(1, 3):
-        next_index = index + offset
-        if next_index >= len(lines):
-            break
-        next_line = lines[next_index]
-        if not next_line.strip():
-            break
-        candidate = _match_part_number(next_line)
-        if candidate:
-            return candidate
-
-    return ""
-
-
-def _value_in_line(line: str, raw_value: str) -> bool:
-    """Return True when ``raw_value`` can be considered present in line."""
-    value = raw_value.strip()
-    if not value:
-        return False
-
-    boundary_pattern = re.compile(rf"(?<![\d.]){re.escape(value)}(?![\d.])")
-    if boundary_pattern.search(line):
-        return True
-
-    try:
-        target = float(value)
-    except ValueError:
-        return False
-
-    for match in NUMBER_PATTERN.findall(line):
-        try:
-            if float(match) == target:
-                return True
-        except ValueError:
-            continue
-
-    return False
-
-
-def _normalize_cell(value: str) -> str:
-    normalized = value.strip()
-    if normalized.upper() in {"<NA>", "NA", "N/A"}:
+def normalize_text(s: Any) -> str:
+    if s is None:
         return ""
-    return normalized
+    s = str(s)
+    # 不可視/改行/タブ→スペース
+    s = s.replace("\u00a0", " ").replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    # 全角スペース
+    s = s.replace("\u3000", " ")
+    # 連続スペースを潰す
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
+def extract_first_number(s: Any) -> Optional[float]:
+    s = normalize_text(s)
+    if not s:
+        return None
+    m = NUM_LOOSE.search(s)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return None
 
-def _normalize_header(value: str) -> str:
-    return re.sub(r"\s+", "", value.strip().upper())
-
-
-def _is_dim_header(header: str, token: str) -> bool:
-    if not header:
+def is_close(a: Optional[float], b: Optional[float], rel_tol: float) -> bool:
+    if a is None or b is None:
         return False
-    if header == token:
-        return True
-    if header in {f"{token}MM", f"{token}(MM)", f"{token}寸法", f"{token}寸"}:
-        return True
-    return header.startswith(f"{token}(") or header.startswith(f"{token}寸")
+    # 0付近だけは絶対誤差っぽく
+    if abs(b) < 1e-9:
+        return abs(a - b) <= rel_tol
+    return abs(a - b) <= abs(b) * rel_tol
+
+def score_part_candidate(cell: str) -> float:
+    """
+    部品番号セル候補のスコア
+    - 形がそれっぽい
+    - 長すぎ/短すぎを抑制
+    - 数値だけより英数混在を少し優遇（現実寄り）
+    """
+    t = normalize_text(cell)
+    if not t:
+        return 0.0
+    if not PART_NO_LOOSE.search(t):
+        return 0.0
+
+    length = len(t)
+    score = 1.0
+    # 長さペナルティ
+    if length < 4:
+        score *= 0.4
+    elif length > 30:
+        score *= 0.5
+
+    # 英字含むなら少し加点
+    if re.search(r"[A-Z]", t, re.IGNORECASE):
+        score *= 1.2
+
+    # 数値だけだと少し減点（ただしゼロにはしない）
+    if re.fullmatch(r"\d+(?:\.\d+)?", t):
+        score *= 0.8
+
+    # 余計な記号が多すぎたら減点
+    if re.search(r"[=,:;]", t):
+        score *= 0.7
+
+    return float(score)
+
+def score_dim_candidate(cell: str) -> float:
+    """
+    L/W/Tセル候補のスコア（数値が取れるほど高い）
+    """
+    n = extract_first_number(cell)
+    if n is None:
+        return 0.0
+    # 現実的な寸法レンジを軽く優遇（雑でOK）
+    if 0 < n < 100000:
+        return 1.0
+    return 0.6
 
 
-def _split_dimension(value: str) -> tuple[str, str]:
-    normalized = _normalize_cell(value)
-    if not normalized:
-        return "", ""
-    match = re.match(r"^\s*([0-9.]+)\s*±\s*([0-9.]+)\s*$", normalized)
-    if match:
-        return match.group(1), match.group(2)
-    return normalized, ""
+# ======================
+# Core: Camelot wrapper (flavor auto)
+# ======================
 
-
-def _extract_main_table(pdf_path: str) -> pd.DataFrame:
-    tables = camelot.read_pdf(
-        pdf_path,
-        pages="1",
-        flavor="lattice",
-        strip_text="\n",
-    )
-    if not tables:
-        raise ValueError("No tables found in PDF.")
-
-    best_table = max(
-        tables,
-        key=lambda table: table.df.shape[0] * table.df.shape[1],
-    )
-    df = best_table.df.copy()
-    return df.applymap(lambda value: value.strip() if isinstance(value, str) else value)
-
-
-def _column_match_counts(df: pd.DataFrame) -> list[int]:
-    counts: list[int] = []
-    for column in df.columns:
-        values = df[column].astype(str).fillna("")
-        counts.append(
-            sum(
-                1
-                for value in values
-                if TABLE_PART_NUMBER_PATTERN.fullmatch(value.strip())
-            )
+def camelot_read(pdf_path: str, pages: str, flavor: str):
+    # 🚀 高速モード（あなたのPDF前提）
+    return list(
+        camelot.read_pdf(
+            pdf_path,
+            pages="1",          # 1ページ固定
+            flavor="lattice",   # 罫線あり固定
+            line_scale=40,
+            strip_text="\n",
         )
-    return counts
-
-
-def _split_left_right_tables(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    counts = _column_match_counts(df)
-    if not counts or max(counts) == 0:
-        return df, pd.DataFrame()
-
-    ranked = sorted(
-        [(index, count) for index, count in enumerate(counts)],
-        key=lambda item: (-item[1], item[0]),
     )
-    part_columns = [ranked[0][0]]
-    if len(ranked) > 1 and ranked[1][1] > 0:
-        part_columns.append(ranked[1][0])
-
-    part_columns = sorted(part_columns)
-    if len(part_columns) < 2:
-        return df, pd.DataFrame()
-
-    split_index = part_columns[1]
-    left = df.iloc[:, :split_index]
-    right = df.iloc[:, split_index:]
-    return left, right
 
 
-def _find_header_row_index(df: pd.DataFrame) -> int:
-    for idx, row in df.iterrows():
-        for cell in row:
-            if isinstance(cell, str) and re.search(r"part", cell, re.IGNORECASE):
-                return idx
-    return 0
+# ======================
+# Core: Table -> page split (左右分割は座標/比率で決める)
+# ======================
 
+@dataclass
+class TableBlock:
+    side: str  # "L" or "R"
+    df: pd.DataFrame
+    meta: Dict[str, Any]
 
-def _find_part_column_index(df: pd.DataFrame) -> int:
-    counts = _column_match_counts(df)
-    if not counts:
-        return 0
-    return max(range(len(counts)), key=lambda index: counts[index])
+def split_table_left_right(df: pd.DataFrame, split_ratio: float, debug: Dict[str, Any], table_idx: int) -> List[TableBlock]:
+    """
+    Camelotのdfは「見た目の列」が既に入ってくるが、それがズレることがある。
+    Tkinter寄せとして「左右」を列インデックスの比率で分ける（最小限の不変条件）。
+    ※本気で座標を使うなら、Camelotの_tableやparsing_reportに依存しやすいのでここでは堅牢さ優先で簡易。
+    """
+    df2 = df.copy()
+    df2 = df2.applymap(normalize_text)
 
+    ncols = df2.shape[1]
+    cut = max(1, min(ncols - 1, int(math.floor(ncols * split_ratio))))
 
-def _find_column_by_keywords(headers: list[str], keywords: list[str]) -> Optional[int]:
-    for idx, header in enumerate(headers):
-        normalized = _normalize_header(header)
-        if any(keyword in normalized for keyword in keywords):
-            return idx
-    return None
+    left = df2.iloc[:, :cut]
+    right = df2.iloc[:, cut:]
 
-
-def _cleanup_and_correct_fields(
-    manufacturer: str,
-    catalog_name: str,
-    other: str,
-) -> tuple[str, str, str]:
-    manufacturer = _normalize_cell(manufacturer)
-    catalog_name = _normalize_cell(catalog_name)
-    other = _normalize_cell(other)
-
-    def looks_like_manufacturer(value: str) -> bool:
-        if not value:
-            return False
-        if re.search(r"\d", value):
-            return False
-        return bool(re.match(r"^[A-Z0-9 &./()-]+$", value, re.IGNORECASE))
-
-    def looks_like_spec(value: str) -> bool:
-        return bool(re.search(r"\d", value)) or any(token in value.upper() for token in ["SPEC", "UL", "ROHS"])
-
-    if not manufacturer and looks_like_manufacturer(catalog_name):
-        manufacturer, catalog_name = catalog_name, ""
-    if not manufacturer and looks_like_manufacturer(other):
-        manufacturer, other = other, ""
-
-    if not catalog_name and other:
-        if looks_like_spec(other) and not looks_like_manufacturer(other):
-            catalog_name, other = other, ""
-
-    return manufacturer, catalog_name, other
-
-
-def _build_rows_from_side(side_df: pd.DataFrame, side_label: str) -> list[dict[str, str]]:
-    if side_df.empty:
-        return []
-
-    header_index = _find_header_row_index(side_df)
-    headers = [str(value) if value is not None else "" for value in side_df.iloc[header_index].tolist()]
-    data_df = side_df.iloc[header_index + 1 :].reset_index(drop=True)
-    if data_df.empty:
-        return []
-
-    part_col_index = _find_part_column_index(data_df)
-
-    total_columns = len(headers)
-    item_col = _find_column_by_keywords(headers, ["ITEM", "品名"])
-    manufacturer_col = _find_column_by_keywords(headers, ["MANUFACTURER", "MAKER", "メーカー"])
-    catalog_col = _find_column_by_keywords(headers, ["CATALOG", "CATALOGNAME", "CATNO", "型番"])
-    color_col = _find_column_by_keywords(headers, ["COLOR", "色"])
-    adhesion_col = _find_column_by_keywords(headers, ["ADHESION", "ADHESIONTYPE", "粘着"])
-    other_col = _find_column_by_keywords(headers, ["OTHER", "備考", "REMARK"])
-
-    l_col = None
-    w_col = None
-    t_col = None
-    for idx, header in enumerate(headers):
-        normalized = _normalize_header(header)
-        if l_col is None and _is_dim_header(normalized, "L"):
-            l_col = idx
-        if w_col is None and _is_dim_header(normalized, "W"):
-            w_col = idx
-        if t_col is None and _is_dim_header(normalized, "T"):
-            t_col = idx
-
-    column_map = {
-        "item_col": item_col,
-        "l_col": l_col,
-        "w_col": w_col,
-        "t_col": t_col,
-        "manufacturer_col": manufacturer_col,
-        "catalog_col": catalog_col,
-        "color_col": color_col,
-        "adhesion_col": adhesion_col,
-        "other_col": other_col,
+    debug["tables"][table_idx]["split"] = {
+        "ncols": ncols,
+        "cut_col_index": cut,
+        "left_cols": left.shape[1],
+        "right_cols": right.shape[1],
     }
-    next_index = part_col_index + 1
-    for key, value in column_map.items():
-        if value is None and next_index < total_columns:
-            column_map[key] = next_index
-            next_index += 1
 
-    item_col = column_map["item_col"]
-    l_col = column_map["l_col"]
-    w_col = column_map["w_col"]
-    t_col = column_map["t_col"]
-    manufacturer_col = column_map["manufacturer_col"]
-    catalog_col = column_map["catalog_col"]
-    color_col = column_map["color_col"]
-    adhesion_col = column_map["adhesion_col"]
-    other_col = column_map["other_col"]
+    blocks = []
+    if left.shape[1] > 0 and left.shape[0] > 0:
+        blocks.append(TableBlock("L", left, {"table_idx": table_idx}))
+    if right.shape[1] > 0 and right.shape[0] > 0:
+        blocks.append(TableBlock("R", right, {"table_idx": table_idx}))
+    return blocks
 
-    rows: list[dict[str, str]] = []
-    for _, row in data_df.iterrows():
-        part_number = _normalize_cell(str(row.iloc[part_col_index]) if part_col_index < len(row) else "")
-        if not TABLE_PART_NUMBER_PATTERN.fullmatch(part_number):
+
+# ======================
+# Core: Column inference (ヘッダに依存しすぎない)
+# ======================
+
+@dataclass
+class InferredColumns:
+    part_col: int
+    l_col: Optional[int] = None
+    w_col: Optional[int] = None
+    t_col: Optional[int] = None
+    confidence: Dict[str, Any] = None
+
+def infer_columns(df: pd.DataFrame) -> Optional[InferredColumns]:
+    """
+    1) 部品番号列：全セルをスコアして列合計が最大の列を採用
+    2) L/W/T列：ヘッダがあれば強く、なければ数値密度で推定
+    """
+    if df.empty:
+        return None
+
+    # ヘッダ行候補：先頭1〜2行を見て「ヘッダっぽさ」を拾う（依存は弱め）
+    header_rows = [0]
+    if df.shape[0] >= 2:
+        header_rows.append(1)
+
+    col_scores_part = []
+    col_scores_dim = []
+
+    for c in range(df.shape[1]):
+        col = df.iloc[:, c].astype(str).map(normalize_text)
+
+        # PART列スコア：全行から
+        s_part = col.map(score_part_candidate).sum()
+
+        # DIM列スコア：全行から（数値取れる密度）
+        s_dim = col.map(score_dim_candidate).sum()
+
+        # ヘッダ加点
+        hdr_text = " ".join([normalize_text(df.iat[r, c]) for r in header_rows if r < df.shape[0]])
+        if HDR_PART.search(hdr_text):
+            s_part *= 1.5
+        if HDR_L.search(hdr_text) or HDR_W.search(hdr_text) or HDR_T.search(hdr_text):
+            s_dim *= 1.2
+
+        col_scores_part.append(float(s_part))
+        col_scores_dim.append(float(s_dim))
+
+    part_col = int(np.argmax(col_scores_part))
+    # 部品番号列が弱すぎるなら None（ただし閾値は低め＝候補保持）
+    if col_scores_part[part_col] < 1.0:
+        return None
+
+    # L/W/Tは「ヘッダ優先、無ければdimスコア上位から割当」
+    l_col = w_col = t_col = None
+
+    # ヘッダで明確に指せるなら採用
+    for c in range(df.shape[1]):
+        hdr_text = " ".join([normalize_text(df.iat[r, c]) for r in header_rows if r < df.shape[0]])
+        if l_col is None and HDR_L.search(hdr_text):
+            l_col = c
+        if w_col is None and HDR_W.search(hdr_text):
+            w_col = c
+        if t_col is None and HDR_T.search(hdr_text):
+            t_col = c
+
+    # 未確定は dimスコアの順位で埋める（part_colは除外）
+    order = np.argsort(col_scores_dim)[::-1].tolist()
+    order = [c for c in order if c != part_col]
+
+    def pick_next(exclude: set) -> Optional[int]:
+        for c in order:
+            if c not in exclude and col_scores_dim[c] >= 1.0:
+                return int(c)
+        return None
+
+    used = {part_col}
+    if l_col is None:
+        l_col = pick_next(used)
+        if l_col is not None:
+            used.add(l_col)
+    if w_col is None:
+        w_col = pick_next(used)
+        if w_col is not None:
+            used.add(w_col)
+    if t_col is None:
+        t_col = pick_next(used)
+        if t_col is not None:
+            used.add(t_col)
+
+    return InferredColumns(
+        part_col=part_col,
+        l_col=l_col,
+        w_col=w_col,
+        t_col=t_col,
+        confidence={
+            "part_scores": col_scores_part,
+            "dim_scores": col_scores_dim,
+            "chosen": {"part": part_col, "L": l_col, "W": w_col, "T": t_col},
+        },
+    )
+
+
+# ======================
+# Core: Row extraction (即死しない、候補保持→正規化)
+# ======================
+
+def extract_rows(df: pd.DataFrame, cols: InferredColumns) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if df.empty:
+        return rows
+
+    for r in range(df.shape[0]):
+        part_raw = normalize_text(df.iat[r, cols.part_col])
+
+        # 候補条件：PARTっぽい“何か”が含まれてれば拾う（fullmatch禁止）
+        if not PART_NO_LOOSE.search(part_raw):
             continue
 
-        item = _normalize_cell(str(row.iloc[item_col]) if item_col is not None and item_col < len(row) else "")
-        l_raw = _normalize_cell(str(row.iloc[l_col]) if l_col is not None and l_col < len(row) else "")
-        w_raw = _normalize_cell(str(row.iloc[w_col]) if w_col is not None and w_col < len(row) else "")
-        t_value = _normalize_cell(str(row.iloc[t_col]) if t_col is not None and t_col < len(row) else "")
-        manufacturer = _normalize_cell(str(row.iloc[manufacturer_col]) if manufacturer_col is not None and manufacturer_col < len(row) else "")
-        catalog_name = _normalize_cell(str(row.iloc[catalog_col]) if catalog_col is not None and catalog_col < len(row) else "")
-        color = _normalize_cell(str(row.iloc[color_col]) if color_col is not None and color_col < len(row) else "")
-        adhesion_type = _normalize_cell(str(row.iloc[adhesion_col]) if adhesion_col is not None and adhesion_col < len(row) else "")
-        other = _normalize_cell(str(row.iloc[other_col]) if other_col is not None and other_col < len(row) else "")
+        # 正規化：余計なスペース削除、連続記号整理など（必要ならここを厚く）
+        part_no = part_raw.replace(" ", "")
+        part_no = part_no.strip()
 
-        manufacturer, catalog_name, other = _cleanup_and_correct_fields(
-            manufacturer,
-            catalog_name,
-            other,
-        )
-
-        l_base, l_tol = _split_dimension(l_raw)
-        w_base, w_tol = _split_dimension(w_raw)
+        L = extract_first_number(df.iat[r, cols.l_col]) if cols.l_col is not None else None
+        W = extract_first_number(df.iat[r, cols.w_col]) if cols.w_col is not None else None
+        T = extract_first_number(df.iat[r, cols.t_col]) if cols.t_col is not None else None
 
         rows.append(
             {
-                "Side": side_label,
-                "PART No.": part_number,
-                "Item": item,
-                "L_base": l_base,
-                "L_tol": l_tol,
-                "W_base": w_base,
-                "W_tol": w_tol,
-                "T": t_value,
-                "MANUFACTURER": manufacturer,
-                "CATALOG NAME": catalog_name,
-                "Color": color,
-                "Adhesion TYPE": adhesion_type,
-                "Other": other,
+                "part_no": part_no,
+                "L": L,
+                "W": W,
+                "T": T,
+                "row_index": r,
+                "raw": {
+                    "part_cell": normalize_text(df.iat[r, cols.part_col]),
+                    "L_cell": normalize_text(df.iat[r, cols.l_col]) if cols.l_col is not None else "",
+                    "W_cell": normalize_text(df.iat[r, cols.w_col]) if cols.w_col is not None else "",
+                    "T_cell": normalize_text(df.iat[r, cols.t_col]) if cols.t_col is not None else "",
+                },
             }
         )
+
     return rows
 
 
-def _to_float(value: Optional[str]) -> Optional[float]:
+def apply_numeric_filters(items: List[Dict[str, Any]], L: Optional[float], W: Optional[float], T: Optional[float], tol: float) -> List[Dict[str, Any]]:
+    if L is None and W is None and T is None:
+        return items
+
+    out = []
+    for it in items:
+        ok = True
+        if L is not None:
+            ok = ok and is_close(it.get("L"), L, tol)
+        if W is not None:
+            ok = ok and is_close(it.get("W"), W, tol)
+        if T is not None:
+            ok = ok and is_close(it.get("T"), T, tol)
+        if ok:
+            out.append(it)
+    return out
+
+
+# ======================
+# Public API: extract
+# ======================
+
+def normalize_pages(pages: Optional[str]) -> str:
+    return "1"
+
+
+def extract_parts_from_pdf(
+    pdf_path: str,
+    pages: Optional[str],
+    split_ratio: float,
+    flavor: str,
+    flt_L: Optional[float],
+    flt_W: Optional[float],
+    flt_T: Optional[float],
+    tol: float,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+
+    pages_s = normalize_pages(pages)
+
+    debug: Dict[str, Any] = {
+        "pdf_path": pdf_path,
+        "pages": pages_s,
+        "flavor": flavor,
+        "split_ratio": split_ratio,
+        "filters": {"L": flt_L, "W": flt_W, "T": flt_T, "tol": tol},
+        "tables": [],
+        "notes": [],
+    }
+
+    # Camelot read
     try:
-        if value is None:
-            return None
-        text = str(value).strip()
-        if text == "":
-            return None
-        return float(text)
-    except Exception:
-        return None
+        tables = camelot_read(pdf_path, pages_s, flavor)
+    except Exception as e:
+        debug["notes"].append(f"camelot_read failed: {repr(e)}")
+        return [], debug
 
+    debug["tables_count"] = len(tables)
 
-def _match_number(cell: str, target: Optional[float]) -> bool:
-    if target is None:
-        return True
-    value = _to_float(cell)
-    if value is None:
-        return False
-    return abs(value - target) < 1e-6
+    all_items: List[Dict[str, Any]] = []
 
-
-def _match_text(cell: str, target: Optional[str]) -> bool:
-    if target is None:
-        return True
-    text = str(target).strip()
-    if text == "":
-        return True
-    return str(cell).strip() == text
-
-
-def _filter_rows(
-    rows: list[dict[str, str]],
-    l_value: Optional[str],
-    w_value: Optional[str],
-    t_value: Optional[str],
-) -> list[dict[str, str]]:
-    l_target = _to_float(l_value)
-    w_target = _to_float(w_value)
-    t_text = str(t_value).strip() if t_value is not None else ""
-    t_target = t_text if t_text != "" else None
-
-    filtered: list[dict[str, str]] = []
-    for row in rows:
-        if not _match_number(row.get("L_base", ""), l_target):
+    for i, t in enumerate(tables):
+        try:
+            df = t.df
+        except Exception as e:
+            debug["tables"].append({"table_idx": i, "error": repr(e)})
             continue
-        if not _match_number(row.get("W_base", ""), w_target):
-            continue
-        if t_target is not None and not _match_text(row.get("T", ""), t_target):
-            continue
-        filtered.append(row)
-    return filtered
 
+        tbl_dbg = {
+            "table_idx": i,
+            "shape": {"rows": int(df.shape[0]), "cols": int(df.shape[1])},
+            "parsing_report": getattr(t, "parsing_report", None),
+        }
+        debug["tables"].append(tbl_dbg)
 
-def _filter_results(
-    lines: List[str],
-    l_value: str,
-    w_value: str,
-    t_value: Optional[str],
-    file_name: str,
-) -> List[SearchResult]:
+        # 左右分割（不変条件）
+        blocks = split_table_left_right(df, split_ratio, debug, i)
 
-    results: List[SearchResult] = []
-    t_value_normalized = (t_value or "").strip()
-    t_required = bool(t_value_normalized)
+        for b in blocks:
+            cols = infer_columns(b.df)
+            if cols is None:
+                tbl_dbg.setdefault("blocks", []).append({"side": b.side, "status": "no_part_col"})
+                continue
 
-    for index, line in enumerate(lines):
-        if (
-            _value_in_line(line, l_value)
-            and _value_in_line(line, w_value)
-            and (not t_required or _value_in_line(line, t_value_normalized))
-        ):
-            part_number = _find_nearby_part_number(lines, index)
-            results.append(
-                SearchResult(
-                    part_number=part_number or "(not found)",
-                    matched_line=line,
-                    file_name=file_name,
-                )
+            tbl_dbg.setdefault("blocks", []).append(
+                {
+                    "side": b.side,
+                    "status": "ok",
+                    "inferred": cols.confidence,
+                }
             )
-    return results
+
+            items = extract_rows(b.df, cols)
+
+            # フィルタ（数値比較）
+            items2 = apply_numeric_filters(items, flt_L, flt_W, flt_T, tol)
+
+            # 0件でも原因が見えるようにカウント
+            tbl_dbg["blocks"][-1]["extracted_rows"] = len(items)
+            tbl_dbg["blocks"][-1]["after_filter_rows"] = len(items2)
+
+            # side/table_idx を付加して追跡可能に
+            for it in items2:
+                it["source"] = {"table_idx": i, "side": b.side}
+                all_items.append(it)
+
+    return all_items, debug
 
 
-# --------------------------------------------------------------------
-# API endpoints
-# --------------------------------------------------------------------
-@app.post("/search")
-async def search_parts(
-    files: List[UploadFile] = File(..., description="PDF files to search"),
-    l_value: str = Form(..., description="Target L value"),
-    w_value: str = Form(..., description="Target W value"),
-    t_value: Optional[str] = Form(None, description="Target T value"),
-    return_csv: bool = Form(False, description="If true, return a CSV file"),
-):
-    all_results: List[SearchResult] = []
+# ======================
+# Endpoint
+# ======================
 
-    for upload in files:
-        lines = list(_read_pdf_lines(upload))
-        matches = _filter_results(
-            lines,
-            l_value,
-            w_value,
-            t_value,
-            upload.filename or "unknown.pdf",
-        )
-        all_results.extend(matches)
-
-    if return_csv:
-        buffer = io.StringIO()
-        writer = csv.writer(buffer)
-        writer.writerow(["part_number", "matched_line", "file_name"])
-        for result in all_results:
-            writer.writerow([result.part_number, result.matched_line, result.file_name])
-        buffer.seek(0)
-
-        return StreamingResponse(
-            iter([buffer.getvalue()]),
-            media_type="text/csv",
-            headers={
-                "Content-Disposition": "attachment; filename=search_results.csv",
-            },
-        )
-
-    return JSONResponse([asdict(result) for result in all_results])
-
-
-@app.post("/extract_lines_csv")
-async def extract_lines_csv(
-    files: List[UploadFile] = File(...),
-):
-    """PDF全文抽出（行単位）をCSVで返す"""
-    async def generate():
-        yield "\ufeff".encode("utf-8")
-
-        buffer = io.StringIO()
-        writer = csv.writer(buffer, lineterminator="\n")
-        writer.writerow(["file_name", "page", "line_no", "text"])
-        yield buffer.getvalue().encode("utf-8")
-        buffer.seek(0)
-        buffer.truncate(0)
-
-        for upload in files:
-            pdf_bytes = await upload.read()
-            for page_no, line_no, text in _iter_pdf_text_lines(pdf_bytes):
-                writer.writerow(
-                    [upload.filename or "unknown.pdf", page_no, line_no, text]
-                )
-                yield buffer.getvalue().encode("utf-8")
-                buffer.seek(0)
-                buffer.truncate(0)
-
-    filename = f"pdf_lines_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-    return StreamingResponse(generate(), media_type="text/csv", headers=headers)
-
-
-async def _extract_table_from_upload(upload: UploadFile) -> pd.DataFrame:
-    suffix = Path(upload.filename or "upload.pdf").suffix or ".pdf"
-    temp_path = ""
+@app.post("/search", response_model=SearchResponse)
+def search(req: SearchRequest):
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            temp_path = tmp.name
-            tmp.write(await upload.read())
+        items, debug = extract_parts_from_pdf(
+            pdf_path=req.pdf_path,
+            pages=req.pages,
+            split_ratio=req.split_ratio,
+            flavor=req.flavor,
+            flt_L=req.L,
+            flt_W=req.W,
+            flt_T=req.T,
+            tol=req.tol,
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal error: {repr(e)}")
 
-        return _extract_main_table(temp_path)
+    # 返却整形
+    out = [
+        {
+            "part_no": it["part_no"],
+            "L": it.get("L"),
+            "W": it.get("W"),
+            "T": it.get("T"),
+            "raw": {"source": it.get("source"), **it.get("raw", {})},
+        }
+        for it in items
+    ]
+
+    return {"items": out, "debug": debug}
+
+import tempfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+@app.post("/api/extract_part_numbers_from_table")
+async def extract_part_numbers_from_table(
+    files: List[UploadFile] = File(...),
+    split_ratio: float = Form(0.5),
+    L: Optional[float] = Form(None),
+    W: Optional[float] = Form(None),
+    T: Optional[float] = Form(None),
+    tol: float = Form(0.05),
+):
+    tmp_paths = []
+    try:
+        # ① 一時保存
+        for f in files:
+            data = await f.read()
+            fd, path = tempfile.mkstemp(suffix=".pdf")
+            os.close(fd)
+            with open(path, "wb") as w:
+                w.write(data)
+            tmp_paths.append((path, f.filename))
+
+        # ② 並列処理（ここが肝）
+        max_workers = min(4, os.cpu_count() or 2, len(tmp_paths))
+        results = {}
+
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    _worker_extract_one,
+                    path,
+                    split_ratio,
+                    L,
+                    W,
+                    T,
+                    tol
+                ): filename
+                for path, filename in tmp_paths
+            }
+
+            for future in as_completed(futures):
+                filename = futures[future]
+                items, _debug = future.result()
+
+                part_numbers = sorted({it["part_no"] for it in items})
+                results[filename] = part_numbers
+
+        # ③ フロント互換レスポンス
+        return [
+            {
+                "file_name": filename,
+                "count": len(results.get(filename, [])),
+                "part_numbers": results.get(filename, []),
+            }
+            for _, filename in tmp_paths
+        ]
+
     finally:
-        if temp_path:
+        for p, _ in tmp_paths:
             try:
-                os.unlink(temp_path)
-            except OSError:
+                os.remove(p)
+            except Exception:
                 pass
 
-
-@app.post("/extract_part_numbers_from_table")
-async def extract_part_numbers_from_table(
-    files: List[UploadFile] = File(..., description="PDF files to extract part numbers"),
-    l_value: Optional[str] = Form(None),
-    w_value: Optional[str] = Form(None),
-    t_value: Optional[str] = Form(None),
-):
-    try:
-        results: list[dict[str, object]] = []
-        for upload in files:
-            df = await _extract_table_from_upload(upload)
-            left_df, right_df = _split_left_right_tables(df)
-
-            rows: list[dict[str, str]] = []
-            rows.extend(_build_rows_from_side(left_df, "Left"))
-            rows.extend(_build_rows_from_side(right_df, "Right"))
-            rows = _filter_rows(rows, l_value, w_value, t_value)
-
-            part_numbers: set[str] = {row["PART No."] for row in rows if row.get("PART No.")}
-
-            result = {
-                "file_name": upload.filename or "unknown.pdf",
-                "count": len(part_numbers),
-                "part_numbers": sorted(part_numbers),
-            }
-            results.append(result)
-
-        return JSONResponse(results)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-
-@app.post("/extract_parts_list_csv")
-async def extract_parts_list_csv(
-    files: List[UploadFile] = File(..., description="PDF files to extract parts list"),
-    l_value: Optional[str] = Form(None),
-    w_value: Optional[str] = Form(None),
-    t_value: Optional[str] = Form(None),
-):
-    try:
-        all_rows: list[dict[str, str]] = []
-        for upload in files:
-            df = await _extract_table_from_upload(upload)
-            left_df, right_df = _split_left_right_tables(df)
-
-            all_rows.extend(_build_rows_from_side(left_df, "Left"))
-            all_rows.extend(_build_rows_from_side(right_df, "Right"))
-
-        all_rows = _filter_rows(all_rows, l_value, w_value, t_value)
-
-        output = io.StringIO()
-        writer = csv.writer(output, lineterminator="\n")
-        headers = [
-            "Side",
-            "PART No.",
-            "Item",
-            "L_base",
-            "L_tol",
-            "W_base",
-            "W_tol",
-            "T",
-            "MANUFACTURER",
-            "CATALOG NAME",
-            "Color",
-            "Adhesion TYPE",
-            "Other",
-        ]
-        writer.writerow(headers)
-        for row in all_rows:
-            writer.writerow([row.get(header, "") for header in headers])
-
-        filename = "parts_list.csv"
-        if len(files) > 1:
-            filename = f"parts_list_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-
-        csv_bytes = output.getvalue().encode("utf-8-sig")
-        return StreamingResponse(
-            iter([csv_bytes]),
-            media_type="text/csv",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-
-@app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
